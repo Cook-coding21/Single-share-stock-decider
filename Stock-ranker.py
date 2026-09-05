@@ -532,6 +532,316 @@ def calculate_drew_checks(balance_sheet, income_statement, cash_flow, currency):
     ]
 
 
+def years_between_periods(latest_period, earlier_period):
+    """Return the approximate number of years between two statement dates."""
+    try:
+        years = (latest_period - earlier_period).days / 365.25
+        return years if years > 0 else None
+    except (AttributeError, TypeError):
+        return None
+
+
+def cagr_check(section, name, what_it_analyses, values, currency, measure_name):
+    """Build an annualised-growth check using the longest Yahoo history available."""
+    latest, earlier = values
+
+    if latest is None or earlier is None:
+        return {
+            "section": section,
+            "name": name,
+            "what_it_analyses": what_it_analyses,
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Positive annualised growth across the available annual history",
+            "reason": "Yahoo Finance did not provide enough annual figures to calculate growth.",
+        }
+
+    latest_period, latest_value = latest
+    earlier_period, earlier_value = earlier
+    years = years_between_periods(latest_period, earlier_period)
+
+    if years is None or latest_value <= 0 or earlier_value <= 0:
+        return {
+            "section": section,
+            "name": name,
+            "what_it_analyses": what_it_analyses,
+            "result": None,
+            "result_value": (
+                f"Latest: {money(latest_value, currency)} ({period_text(latest_period)}) "
+                f"| Earlier: {money(earlier_value, currency)} ({period_text(earlier_period)})"
+            ),
+            "pass_rule": "Positive annualised growth across the available annual history",
+            "reason": (
+                f"{measure_name} CAGR is not meaningful when a comparison figure "
+                "is zero or negative."
+            ),
+        }
+
+    cagr = (latest_value / earlier_value) ** (1 / years) - 1
+    result = bool(cagr > 0)
+    history_description = f"{years:.1f} years of available annual history"
+
+    return {
+        "section": section,
+        "name": name,
+        "what_it_analyses": what_it_analyses,
+        "result": result,
+        "result_value": (
+            f"CAGR: {percentage(cagr)} over {history_description} "
+            f"| Latest: {money(latest_value, currency)} ({period_text(latest_period)}) "
+            f"| Earlier: {money(earlier_value, currency)} ({period_text(earlier_period)})"
+        ),
+        "pass_rule": "Positive annualised growth across the available annual history",
+        "reason": (
+            f"Favourable: {measure_name} has grown across the available annual history."
+            if result
+            else f"Needs review: {measure_name} has shrunk across the available annual history."
+        ),
+    }
+
+
+def calculate_plain_bagel_checks(
+    balance_sheet,
+    income_statement,
+    cash_flow,
+    currency,
+):
+    """Create a Plain Bagel-inspired long-term financial checklist.
+
+    Yahoo Finance usually supplies only a few annual periods. This adapts the
+    video's long-term process to the longest annual history Yahoo provides; it
+    is not a replacement for five-, ten-, or fifteen-year report analysis.
+    """
+    revenue_values = statement_values(income_statement, ["Total Revenue"])
+    revenue_cagr = cagr_check(
+        "INCOME STATEMENT",
+        "Revenue CAGR (available history)",
+        "Whether sales have grown at an annualised rate across the available annual history.",
+        comparison_values(income_statement, ["Total Revenue"]),
+        currency,
+        "Revenue",
+    )
+
+    operating_income_cagr = cagr_check(
+        "INCOME STATEMENT",
+        "Operating income CAGR (available history)",
+        "Whether core-business profit has grown at an annualised rate across the available annual history.",
+        comparison_values(income_statement, ["Operating Income"]),
+        currency,
+        "Operating income",
+    )
+
+    revenue_by_period = dict(revenue_values)
+    operating_expense_values = statement_values(
+        income_statement,
+        ["Operating Expense", "Operating Expenses"],
+    )
+    operating_expense_ratios = [
+        (period, operating_expense / revenue_by_period[period])
+        for period, operating_expense in operating_expense_values
+        if period in revenue_by_period and revenue_by_period[period] > 0
+    ]
+
+    if len(operating_expense_ratios) < 2:
+        operating_cost_share = {
+            "section": "INCOME STATEMENT",
+            "name": "Operating-cost share trend",
+            "what_it_analyses": "Whether operating costs are taking a larger or smaller share of revenue over time.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Operating expenses are the same or a smaller share of revenue than the earlier year",
+            "reason": "Yahoo Finance did not provide enough matching annual operating-expense and revenue figures to compare.",
+        }
+    else:
+        latest_period, latest_ratio = operating_expense_ratios[0]
+        earlier_index = min(3, len(operating_expense_ratios) - 1)
+        earlier_period, earlier_ratio = operating_expense_ratios[earlier_index]
+        operating_cost_share_result = bool(latest_ratio <= earlier_ratio)
+        operating_cost_share = {
+            "section": "INCOME STATEMENT",
+            "name": "Operating-cost share trend",
+            "what_it_analyses": "Whether operating costs are taking a larger or smaller share of revenue over time.",
+            "result": operating_cost_share_result,
+            "result_value": (
+                f"Latest: {percentage(latest_ratio)} of revenue ({period_text(latest_period)}) "
+                f"| Earlier: {percentage(earlier_ratio)} of revenue ({period_text(earlier_period)})"
+            ),
+            "pass_rule": "Operating expenses are the same or a smaller share of revenue than the earlier year",
+            "reason": (
+                "Favourable: operating expenses are not taking a larger share of revenue."
+                if operating_cost_share_result
+                else "Needs review: operating expenses are taking a larger share of revenue."
+            ),
+        }
+
+    cash_by_period = dict(
+        statement_values(
+            balance_sheet,
+            [
+                "Cash Cash Equivalents And Short Term Investments",
+                "Cash And Cash Equivalents",
+                "Cash Financial",
+            ],
+        )
+    )
+    debt_by_period = dict(statement_values(balance_sheet, ["Total Debt"]))
+    net_cash_values = [
+        (period, cash - debt_by_period[period])
+        for period, cash in cash_by_period.items()
+        if period in debt_by_period
+    ]
+    try:
+        net_cash_values.sort(key=lambda item: item[0], reverse=True)
+    except TypeError:
+        pass
+
+    if len(net_cash_values) < 2:
+        net_debt_trend = {
+            "section": "BALANCE SHEET",
+            "name": "Net cash/(debt) trend",
+            "what_it_analyses": "Whether the company's cash position relative to total debt is improving over time.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Net cash/(debt) is better than or equal to the earlier year",
+            "reason": "Yahoo Finance did not provide enough matching annual cash and total-debt figures to compare.",
+        }
+    else:
+        latest_period, latest_net_cash = net_cash_values[0]
+        earlier_index = min(3, len(net_cash_values) - 1)
+        earlier_period, earlier_net_cash = net_cash_values[earlier_index]
+        net_debt_trend_result = bool(latest_net_cash >= earlier_net_cash)
+        net_debt_trend = {
+            "section": "BALANCE SHEET",
+            "name": "Net cash/(debt) trend",
+            "what_it_analyses": "Whether the company's cash position relative to total debt is improving over time.",
+            "result": net_debt_trend_result,
+            "result_value": (
+                f"Latest: {money(latest_net_cash, currency)} ({period_text(latest_period)}) "
+                f"| Earlier: {money(earlier_net_cash, currency)} ({period_text(earlier_period)})"
+            ),
+            "pass_rule": "Net cash/(debt) is better than or equal to the earlier year",
+            "reason": (
+                "Favourable: cash relative to total debt has improved or remained stable."
+                if net_debt_trend_result
+                else "Needs review: cash relative to total debt has weakened."
+            ),
+        }
+
+    net_income_by_period = dict(statement_values(income_statement, ["Net Income"]))
+    equity_by_period = dict(
+        statement_values(
+            balance_sheet,
+            ["Stockholders Equity", "Total Stockholder Equity", "Common Stock Equity"],
+        )
+    )
+    annual_roe_values = [
+        (period, net_income / equity_by_period[period])
+        for period, net_income in net_income_by_period.items()
+        if period in equity_by_period and equity_by_period[period] != 0
+    ]
+
+    if not annual_roe_values:
+        return_on_equity_history = {
+            "section": "INCOME STATEMENT + BALANCE SHEET",
+            "name": "Return on equity history",
+            "what_it_analyses": "Whether the company has produced positive profit relative to shareholder equity across the available annual history.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Average annual return on ending equity is positive",
+            "reason": "Yahoo Finance did not provide matching annual net-income and shareholder-equity figures.",
+        }
+    else:
+        average_roe = sum(value for _, value in annual_roe_values) / len(annual_roe_values)
+        roe_history_result = bool(average_roe > 0)
+        return_on_equity_history = {
+            "section": "INCOME STATEMENT + BALANCE SHEET",
+            "name": "Return on equity history",
+            "what_it_analyses": "Whether the company has produced positive profit relative to shareholder equity across the available annual history.",
+            "result": roe_history_result,
+            "result_value": (
+                f"Average: {percentage(average_roe)} across "
+                f"{len(annual_roe_values)} annual periods"
+            ),
+            "pass_rule": "Average annual return on ending equity is positive",
+            "reason": (
+                "Favourable: the company has generated a positive average return on shareholder equity."
+                if roe_history_result
+                else "Needs review: the company has not generated a positive average return on shareholder equity."
+            ),
+        }
+
+    operating_cash_flow_by_period = dict(
+        statement_values(
+            cash_flow,
+            [
+                "Operating Cash Flow",
+                "Total Cash From Operating Activities",
+                "Cash Flow From Continuing Operating Activities",
+            ],
+        )
+    )
+    capital_expenditure_by_period = dict(
+        statement_values(cash_flow, ["Capital Expenditure", "Capital Expenditures"])
+    )
+    cash_after_capex_values = [
+        (
+            period,
+            operating_cash_flow,
+            capital_expenditure_by_period[period],
+            operating_cash_flow - abs(capital_expenditure_by_period[period]),
+        )
+        for period, operating_cash_flow in operating_cash_flow_by_period.items()
+        if period in capital_expenditure_by_period
+    ]
+    try:
+        cash_after_capex_values.sort(key=lambda item: item[0], reverse=True)
+    except TypeError:
+        pass
+
+    if not cash_after_capex_values:
+        capital_expenditure_coverage = {
+            "section": "CASH FLOW STATEMENT",
+            "name": "Capital-expenditure coverage",
+            "what_it_analyses": "Whether cash from operations covers the company's latest capital spending.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Operating cash flow is greater than capital expenditure",
+            "reason": "Yahoo Finance did not provide matching annual operating-cash-flow and capital-expenditure figures.",
+        }
+    else:
+        latest_period, operating_cash_flow, capital_expenditure, cash_after_capex = (
+            cash_after_capex_values[0]
+        )
+        capital_expenditure_coverage_result = bool(cash_after_capex > 0)
+        capital_expenditure_coverage = {
+            "section": "CASH FLOW STATEMENT",
+            "name": "Capital-expenditure coverage",
+            "what_it_analyses": "Whether cash from operations covers the company's latest capital spending.",
+            "result": capital_expenditure_coverage_result,
+            "result_value": (
+                f"Operating cash flow: {money(operating_cash_flow, currency)} "
+                f"| Capital expenditure: {money(abs(capital_expenditure), currency)} "
+                f"| Cash after spending: {money(cash_after_capex, currency)} "
+                f"({period_text(latest_period)})"
+            ),
+            "pass_rule": "Operating cash flow is greater than capital expenditure",
+            "reason": (
+                "Favourable: operating cash flow covered the latest capital spending."
+                if capital_expenditure_coverage_result
+                else "Needs review: capital spending was greater than operating cash flow."
+            ),
+        }
+
+    return [
+        revenue_cagr,
+        operating_income_cagr,
+        operating_cost_share,
+        net_debt_trend,
+        return_on_equity_history,
+        capital_expenditure_coverage,
+    ]
+
+
 def calculate_risk_metrics(daily_close):
     """Calculate simple one-year risk observations from Yahoo price history."""
     daily_returns = daily_close.pct_change().dropna()
@@ -583,6 +893,7 @@ def get_stock_data(ticker):
     if str(quote_type).upper() in FUND_TYPES:
         tilbury_checks = None
         drew_checks = None
+        plain_bagel_checks = None
     else:
         balance_sheet = safe_statement(stock, ["balance_sheet"])
         income_statement = safe_statement(stock, ["income_stmt", "financials"])
@@ -594,6 +905,12 @@ def get_stock_data(ticker):
             info.get("currency", "$"),
         )
         drew_checks = calculate_drew_checks(
+            balance_sheet,
+            income_statement,
+            cash_flow,
+            info.get("currency", "$"),
+        )
+        plain_bagel_checks = calculate_plain_bagel_checks(
             balance_sheet,
             income_statement,
             cash_flow,
@@ -652,6 +969,7 @@ def get_stock_data(ticker):
         "risk": calculate_risk_metrics(one_year_close),
         "tilbury_checks": tilbury_checks,
         "drew_checks": drew_checks,
+        "plain_bagel_checks": plain_bagel_checks,
     }
 
 
@@ -710,6 +1028,105 @@ def print_drew_valuation_step(data):
         "Next step: make conservative forecasts for up to three years, then "
         "use a DCF or reverse DCF. A strong screening score is not a buy signal "
         "unless the valuation also looks attractive."
+    )
+
+
+def print_plain_bagel_checklist(checks):
+    """Print the Plain Bagel-inspired checklist with clear analysis labels."""
+    passed_checks, available_checks = tilbury_score(checks)
+
+    print(
+        f"Screening score: {passed_checks}/{len(checks)} favourable checks"
+        f"  |  Data available for {available_checks}/{len(checks)} checks"
+    )
+    print(
+        "Yahoo Finance usually supplies only a few annual periods. These checks "
+        "use the longest available history, not a full 5-, 10-, or 15-year study."
+    )
+
+    for check in checks:
+        print(
+            f"\n[{tilbury_marker(check['result']):7}] "
+            f"{check['section']} — {check['name']}"
+        )
+        print(f"          Analyses: {check['what_it_analyses']}")
+        print(f"          Result: {check['result_value']}")
+        print(f"          Favourable result: {check['pass_rule']}")
+        print(f"          {check['reason']}")
+
+
+def print_plain_bagel_valuation_step(data):
+    """Explain the Plain Bagel valuation and peer-comparison work still needed."""
+    print("\nPLAIN BAGEL VALUATION & PEER COMPARISON — MANUAL REVIEW REQUIRED")
+    print(
+        "Analyses: whether this stock is fairly priced against its own history, "
+        "similar companies, and conservative future cash flows."
+    )
+    print(
+        f"Available starting figures: P/E {number_text(data['pe_ratio'])}"
+        f"  |  Market value {money(data['market_cap'], data['currency'])}"
+    )
+    print(
+        "Next step: compare valuation multiples with direct peers and the "
+        "company's history. Use a DCF with conservative forecasts and test how "
+        "the result changes when assumptions change."
+    )
+
+
+def overall_score_percentage(checks):
+    """Return the percentage of passed checks among checks with usable data."""
+    passed_checks, available_checks = tilbury_score(checks)
+
+    if not available_checks:
+        return None, passed_checks, available_checks
+
+    return (passed_checks / available_checks) * 100, passed_checks, available_checks
+
+
+def print_overall_research_score(data, is_fund):
+    """Print a transparent summary without presenting it as a buy recommendation."""
+    print("\nOVERALL FINANCIAL-RESEARCH SUMMARY")
+
+    if is_fund:
+        print(
+            "Not applicable: the three company financial-statement frameworks "
+            "do not suit funds or indexes."
+        )
+        return
+
+    frameworks = [
+        ("Mark Tilbury", data["tilbury_checks"]),
+        ("Drew Cohen", data["drew_checks"]),
+        ("Plain Bagel", data["plain_bagel_checks"]),
+    ]
+    usable_frameworks = []
+
+    for name, checks in frameworks:
+        score, passed_checks, available_checks = overall_score_percentage(checks)
+
+        if score is None:
+            print(f"{name}: No score — Yahoo Finance data was unavailable.")
+            continue
+
+        usable_frameworks.append(score)
+        print(
+            f"{name}: {score:.0f}/100 "
+            f"({passed_checks}/{available_checks} available checks favourable)"
+        )
+
+    if not usable_frameworks:
+        print("Overall financial-research score: Not available")
+        return
+
+    overall_score = sum(usable_frameworks) / len(usable_frameworks)
+    print(f"\nOverall financial-research score: {overall_score:.0f}/100")
+    print(
+        "Calculation: equal-weight average of the available framework percentages. "
+        "The frameworks overlap, so this is a research summary—not a buy signal."
+    )
+    print(
+        "Business quality, strategy, peer comparison, valuation, and your risk "
+        "tolerance still require manual review."
     )
 
 
@@ -799,6 +1216,18 @@ def print_report(data):
     else:
         print_drew_checklist(data["drew_checks"])
         print_drew_valuation_step(data)
+
+    print("\nPLAIN BAGEL / RICHARD COFFIN FINANCIAL CHECKLIST")
+    if is_fund:
+        print(
+            "Not applicable: this company financial-statement checklist does "
+            "not suit funds or indexes."
+        )
+    else:
+        print_plain_bagel_checklist(data["plain_bagel_checks"])
+        print_plain_bagel_valuation_step(data)
+
+    print_overall_research_score(data, is_fund)
 
     print(
         "\nThese are simple financial rules of thumb, not a buy or sell "
