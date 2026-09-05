@@ -1,183 +1,141 @@
-Yahoo Finance Stock Researcher
+# Yahoo Finance Stock Researcher
 
-A simple Python research tool for stocks, ETFs, index funds, and indexes. Enter a ticker symbol and the program creates a readable report using data returned by Yahoo Finance.
+A simple Python research tool for stocks, ETFs, index funds, and indexes. Enter a ticker symbol, and the program creates a readable report using data returned by Yahoo Finance.
 
-This project is for research and learning. It does not give buy or sell instructions.
+This project is for research and learning. It does **not** give buy or sell instructions
 
-What the program does
+## What the program does
 
-For a ticker such as AAPL, MSFT, GOOGL, or 0P00013P6I.L, the program:
+For a ticker such as `AAPL`, `MSFT`, `GOOGL`, or `0P00013P6I.L`, the program:
 
-Asks which investment you want to research.
-
-Retrieves up to two years of daily Yahoo Finance price history.
-
-Uses the latest available one-minute price data when Yahoo Finance provides it; otherwise, it uses the latest daily price.
-
-Shows the latest price and its timestamp.
-
-Calculates the one-year price change.
-
-Calculates 50-day and 200-day moving averages.
-
-Labels the moving-average trend as Upward or Downward.
-
-Shows company figures where they are available:
-
-market value
-
-P/E ratio
-
-profit margin
-
-return on equity
-
-revenue growth
-
-debt to equity
-
-Calculates simple historical-risk observations from the last year of prices:
-
-annualised volatility
-
-largest fall from an earlier high (maximum drawdown)
-
-current distance below the one-year high
-
-Retrieves annual balance-sheet, income-statement, and cash-flow data where Yahoo Finance provides it.
-
-Produces a three-check quantitative financial score based on the rules of thumb discussed by Mark Tilbury.
+- Asks which investment you want to research.
+- Retrieves up to two years of daily Yahoo Finance price history.
+- Uses the latest available one-minute price data when Yahoo Finance provides it; otherwise, it uses the latest daily price.
+- Shows the latest price and its timestamp.
+- Calculates the one-year price change.
+- Calculates 50-day and 200-day moving averages.
+- Labels the moving-average trend as **Upward** or **Downward**.
+- Shows company figures where they are available:
+  - market value
+  - P/E ratio
+  - profit margin
+  - return on equity
+  - revenue growth
+  - debt to equity
+- Calculates simple historical-risk observations from the last year of prices:
+  - annualised volatility
+  - largest fall from an earlier high (maximum drawdown)
+  - current distance below the one-year high
+- Retrieves annual balance-sheet, income-statement, and cash-flow data where Yahoo Finance provides it.
+- Produces a three-check quantitative financial score based on the rules of thumb discussed by Mark Tilbury.
 
 For ETFs, mutual funds, and indexes, company-specific measures such as profit margin, debt, and P/E are marked as not applicable. The Mark Tilbury financial-statement score is also not used, because it is designed for individual companies.
 
-Mark Tilbury quantitative checks
+## Mark Tilbury quantitative checks
 
 The score is a screening aid, not an investment recommendation. It shows how many of these three financial checks passed:
 
-Check
+| Check | Calculation | Pass rule |
+| --- | --- | --- |
+| Current ratio | Current assets ÷ current liabilities | Above 1.00 |
+| Operating margin | Operating income ÷ total revenue | Above 15.00% |
+| Free-cash-flow trend | Latest annual free cash flow compared with the previous annual figure | Latest figure is higher |
 
-Calculation
+The output shows a score such as `2/3 checks passed`. Each line is labelled **Balance Sheet**, **Income Statement**, or **Cash Flow Statement**, and then shows the result, the pass rule, and a plain-English reason for the pass, review flag, or missing data. If Yahoo Finance does not provide enough annual financial data, the check shows **NO DATA** rather than failing. The existing price, trend, P/E, debt, and risk figures remain in the report, but they do **not** affect this score.
 
-Pass rule
+## Requirements
 
-Current ratio
+- Python 3
+- Internet connection
+- The `yfinance` package
 
-Current assets ÷ current liabilities
+This version uses **Yahoo Finance only**. It does not need an Alpha Vantage account or API key.
 
-Above 1.00
-
-Operating margin
-
-Operating income ÷ total revenue
-
-Above 15.00%
-
-Free-cash-flow trend
-
-Latest annual free cash flow compared with the previous annual figure
-
-Latest figure is higher
-
-The output shows a score such as 2/3 checks passed, followed by the calculation behind every check. If Yahoo Finance does not provide enough annual financial data, the check shows NO DATA rather than failing. The existing price, trend, P/E, debt, and risk figures remain in the report, but they do not affect this score.
-
-Requirements
-
-Python 3
-
-Internet connection
-
-The yfinance package
-
-This version uses Yahoo Finance only. It does not need an Alpha Vantage account or API key.
-
-Installation
+## Installation
 
 Open the project folder in PyCharm. In PyCharm's Terminal, create a virtual environment and install the project packages:
 
+```bash
 python -m venv .venv
 python -m pip install -r requirements.txt
+```
 
-If you do not have a requirements.txt file yet, install the required package with:
+If you do not have a `requirements.txt` file yet, install the required package with:
 
+```bash
 python -m pip install yfinance
+```
 
-Then create requirements.txt if needed:
+Then create `requirements.txt` if needed:
 
+```bash
 python -m pip freeze > requirements.txt
+```
 
-Running the program
+## Running the program
 
-In PyCharm, right-click Stock-ranker.py and choose Run.
+In PyCharm, right-click `Stock-ranker.py` and choose **Run**.
 
 Or, from the Terminal:
 
+```bash
 python Stock-ranker.py
+```
 
 When prompted, enter a ticker symbol:
 
+```text
 Which investment would you like to research? AAPL
+```
 
-Enter quit, q, or exit to close the program.
+Enter `quit`, `q`, or `exit` to close the program.
 
-Understanding the report
+## Understanding the report
 
-Price & momentum
+### Price & momentum
 
-Latest price: the most recent price Yahoo Finance returned, with its timestamp.
+- **Latest price**: the most recent price Yahoo Finance returned, with its timestamp.
+- **One-year return**: the percentage change over roughly the last 252 trading days.
+- **50-day / 200-day averages**: average closing prices over those periods.
+- **Trend**: upward when the 50-day average is above the 200-day average; otherwise downward.
 
-One-year return: the percentage change over roughly the last 252 trading days.
+### Company metrics
 
-50-day / 200-day averages: average closing prices over those periods.
+- **P/E ratio**: share price compared with earnings per share.
+- **Profit margin**: the share of revenue kept as profit.
+- **Return on equity**: profit relative to shareholder equity.
+- **Revenue growth**: Yahoo Finance's reported revenue-growth measure.
+- **Debt to equity**: debt compared with shareholder equity.
 
-Trend: upward when the 50-day average is above the 200-day average; otherwise downward.
+### Risk
 
-Company metrics
+- **Volatility**: how widely daily prices have moved over the last year. It is not a forecast.
+- **Largest fall**: the worst fall from a previous high during the last year.
+- **Below one-year high**: how far the latest price is below the highest price in that period.
 
-P/E ratio: share price compared with earnings per share.
+### Mark Tilbury quantitative checks
 
-Profit margin: the share of revenue kept as profit.
+- **Current ratio**: whether the company had enough current assets to cover current liabilities in the latest annual report.
+- **Operating margin**: the share of revenue remaining after operating costs in the latest annual report.
+- **Free-cash-flow trend**: whether annual free cash flow increased compared with the previous annual report. A negative latest free-cash-flow figure is highlighted for review.
 
-Return on equity: profit relative to shareholder equity.
+## Important limits
 
-Revenue growth: Yahoo Finance's reported revenue-growth measure.
+- Yahoo Finance may provide delayed rather than real-time prices. Always check the timestamp.
+- One-minute data is often unavailable for funds, indexes, or some exchanges; the program will use the latest daily value instead.
+- Company figures do not update every minute. They typically change when new financial results are reported.
+- Yahoo Finance may not provide annual financial statements for every ticker, especially funds, indexes, or some international listings. In that case, a quantitative check will show **NO DATA**.
+- A score does not tell you whether to invest. Compare similar investments, review the latest official company or fund documents, and consider your own goals and risk tolerance.
 
-Debt to equity: debt compared with shareholder equity.
+## Project files
 
-Risk
-
-Volatility: how widely daily prices have moved over the last year. It is not a forecast.
-
-Largest fall: the worst fall from a previous high during the last year.
-
-Below one-year high: how far the latest price is below the highest price in that period.
-
-Mark Tilbury quantitative checks
-
-Current ratio: whether the company had enough current assets to cover current liabilities in the latest annual report.
-
-Operating margin: the share of revenue remaining after operating costs in the latest annual report.
-
-Free-cash-flow trend: whether annual free cash flow increased compared with the previous annual report. A negative latest free-cash-flow figure is highlighted for review.
-
-Important limits
-
-Yahoo Finance may provide delayed rather than real-time prices. Always check the timestamp.
-
-One-minute data is often unavailable for funds, indexes, or some exchanges; the program will use the latest daily value instead.
-
-Company figures do not update every minute. They typically change when new financial results are reported.
-
-Yahoo Finance may not provide annual financial statements for every ticker, especially funds, indexes, or some international listings. In that case, a quantitative check will show NO DATA.
-
-A score does not tell you whether to invest. Compare similar investments, review the latest official company or fund documents, and consider your own goals and risk tolerance.
-
-Project files
-
+```text
 Stock-ranker.py     Main program
 requirements.txt    Python packages needed to run the program
 .gitignore          Files Git should not upload
 README.md           Project guide
+```
 
-Keeping the project safe on GitHub
+## Keeping the project safe on GitHub
 
-Commit Stock-ranker.py, requirements.txt, .gitignore, and this README to GitHub. Do not commit .venv/, because it is a local Python environment that can be recreated from requirements.txt.
+Commit `Stock-ranker.py`, `requirements.txt`, `.gitignore`, and this README to GitHub. Do not commit `.venv/`, because it is a local Python environment that can be recreated from `requirements.txt`.
