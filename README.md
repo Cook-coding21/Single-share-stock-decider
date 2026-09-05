@@ -30,7 +30,7 @@ For a ticker such as `AAPL`, `MSFT`, `GOOGL`, or `0P00013P6I.L`, the program:
 - Produces a three-check quantitative financial score based on the rules of thumb discussed by Mark Tilbury.
 - Produces a separate seven-check financial screen inspired by Drew Cohen's research process, followed by a manual valuation step.
 - Produces a separate six-check financial screen inspired by Richard Coffin / The Plain Bagel's research process, followed by manual valuation and peer-comparison steps.
-- Summarises the three company frameworks in an overall financial-research score at the end of the report.
+- Produces a weighted financial-research score from selected, non-duplicated checks at the end of the report.
 
 For ETFs, mutual funds, and indexes, company-specific measures such as profit margin, debt, and P/E are marked as not applicable. The Mark Tilbury, Drew Cohen, and Plain Bagel financial-statement checks are also not used, because they are designed for individual companies.
 
@@ -83,9 +83,33 @@ It also prints a separate manual step for peer comparison and valuation. Use it 
 
 ## Overall financial-research score
 
-At the end of each company report, the script shows the percentage of available checks that were favourable for each framework, then calculates an **equal-weight average** of the Mark Tilbury, Drew Cohen, and Plain Bagel percentages.
+The overall score is a transparent **100-point financial screen**. It does not average the three frameworks, because many checks overlap. Instead, it selects each important financial idea once and gives more weight to profitability, growth, cash generation, and balance-sheet safety.
 
-Missing Yahoo Finance data is excluded from a framework's percentage rather than counted as a failure. The frameworks contain related checks, so the overall result is only a quick research summary—**not** a buy score or investment recommendation. Business quality, strategy, peer comparison, valuation, diversification, and your own risk tolerance still need manual review.
+| Check | Weight | Why it matters in this screen |
+| --- | ---: | --- |
+| Operating margin | 15 | Core-business profitability |
+| Revenue CAGR | 15 | Longer-term sales growth |
+| Current ratio | 10 | Short-term liquidity |
+| Cash versus total debt | 10 | Debt burden and cash protection |
+| Free-cash-flow trend | 10 | Direction of cash generation |
+| Capital-expenditure coverage | 10 | Whether operating cash flow funds investment spending |
+| Return-on-equity history | 10 | Return on shareholder capital |
+| Operating-income CAGR | 10 | Longer-term core-profit growth |
+| Operating-cost share trend | 5 | Cost discipline as the business grows |
+| Stock-based-compensation trend | 5 | Potential shareholder dilution |
+
+The weights total 100. If Yahoo Finance does not provide a figure, that check is excluded rather than treated as a failure. The program displays **weighted data coverage** so that a high score based on too little data is marked as low confidence.
+
+The score also cannot be labelled **strong** when a high-priority check fails. High-priority checks are operating margin, revenue growth, current ratio, cash versus total debt, free-cash-flow trend, capital-expenditure coverage, and return-on-equity history.
+
+| Score band | Screen result |
+| --- | --- |
+| Below 50 | Weak financial screen — do not progress without a clear explanation |
+| 50–69 | Mixed financial screen — watchlist and further research |
+| 70–84 | Solid financial screen — valuation and risk review required |
+| 85–100 | Strong financial screen — valuation and risk review still required |
+
+This is only a financial-health screen, **not** a good/bad investment verdict or a buy score. A company can score highly and still be overpriced, face serious competitive risks, or be unsuitable for your portfolio. Business quality, strategy, peer comparison, diversification, valuation, and your own risk tolerance still require manual review.
 
 ## Requirements
 
