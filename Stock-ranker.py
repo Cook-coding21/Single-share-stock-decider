@@ -57,6 +57,166 @@ def safe_info(stock):
         return {}
 
 
+def safe_statement(stock, attribute_names):
+    """Return the first available annual Yahoo Finance financial statement."""
+    for attribute_name in attribute_names:
+        try:
+            statement = getattr(stock, attribute_name)
+            if statement is not None and not statement.empty:
+                return statement
+        except Exception:
+            continue
+
+    return None
+
+
+def statement_values(statement, row_names):
+    """Return usable annual values for the first matching Yahoo statement row."""
+    if statement is None or statement.empty:
+        return []
+
+    for row_name in row_names:
+        if row_name not in statement.index:
+            continue
+
+        values = []
+        row = statement.loc[row_name]
+
+        for period in statement.columns:
+            value = number(row[period])
+            if value is not None:
+                values.append((period, value))
+
+        try:
+            return sorted(values, key=lambda item: item[0], reverse=True)
+        except TypeError:
+            return values
+
+    return []
+
+
+def latest_statement_value(statement, row_names):
+    """Return the latest annual value for one or more possible row names."""
+    values = statement_values(statement, row_names)
+    return values[0][1] if values else None
+
+
+def period_text(period):
+    """Format a financial-statement period for the report."""
+    return period.strftime("%Y-%m-%d") if hasattr(period, "strftime") else str(period)
+
+
+def free_cash_flow_values(cash_flow):
+    """Get annual free cash flow, deriving it when Yahoo does not provide it."""
+    direct_values = statement_values(cash_flow, ["Free Cash Flow"])
+    if direct_values:
+        return direct_values
+
+    operating_values = dict(
+        statement_values(
+            cash_flow,
+            [
+                "Operating Cash Flow",
+                "Total Cash From Operating Activities",
+                "Cash Flow From Continuing Operating Activities",
+            ],
+        )
+    )
+    capital_expenditure_values = dict(
+        statement_values(cash_flow, ["Capital Expenditure", "Capital Expenditures"])
+    )
+
+    values = []
+    for period, operating_cash_flow in operating_values.items():
+        capital_expenditure = capital_expenditure_values.get(period)
+
+        if capital_expenditure is None:
+            continue
+
+        free_cash_flow = (
+            operating_cash_flow + capital_expenditure
+            if capital_expenditure < 0
+            else operating_cash_flow - capital_expenditure
+        )
+        values.append((period, free_cash_flow))
+
+    try:
+        return sorted(values, key=lambda item: item[0], reverse=True)
+    except TypeError:
+        return values
+
+
+def calculate_tilbury_checks(balance_sheet, income_statement, cash_flow, currency):
+    """Calculate Mark Tilbury-style quantitative checks from annual Yahoo data."""
+    current_assets = latest_statement_value(
+        balance_sheet,
+        ["Current Assets", "Total Current Assets"],
+    )
+    current_liabilities = latest_statement_value(
+        balance_sheet,
+        ["Current Liabilities", "Total Current Liabilities"],
+    )
+
+    if current_assets is None or current_liabilities in {None, 0}:
+        current_ratio_result = None
+        current_ratio_detail = "Current assets or current liabilities were not available."
+    else:
+        current_ratio = current_assets / current_liabilities
+        current_ratio_result = bool(current_ratio > 1)
+        current_ratio_detail = f"Current ratio: {current_ratio:.2f} (needs to be above 1.00)."
+
+    operating_income = latest_statement_value(income_statement, ["Operating Income"])
+    total_revenue = latest_statement_value(income_statement, ["Total Revenue"])
+
+    if operating_income is None or total_revenue in {None, 0}:
+        operating_margin_result = None
+        operating_margin_detail = "Operating income or total revenue was not available."
+    else:
+        operating_margin = operating_income / total_revenue
+        operating_margin_result = bool(operating_margin > 0.15)
+        operating_margin_detail = (
+            f"Operating margin: {percentage(operating_margin)} "
+            "(needs to be above 15.00%)."
+        )
+
+    free_cash_flow = free_cash_flow_values(cash_flow)
+
+    if len(free_cash_flow) < 2:
+        cash_flow_result = None
+        cash_flow_detail = "Two annual free-cash-flow figures were not available."
+    else:
+        latest_period, latest_free_cash_flow = free_cash_flow[0]
+        previous_period, previous_free_cash_flow = free_cash_flow[1]
+        cash_flow_result = bool(latest_free_cash_flow > previous_free_cash_flow)
+        cash_flow_detail = (
+            f"Free cash flow: {money(latest_free_cash_flow, currency)} "
+            f"({period_text(latest_period)}) vs "
+            f"{money(previous_free_cash_flow, currency)} "
+            f"({period_text(previous_period)})."
+        )
+
+        if latest_free_cash_flow < 0:
+            cash_flow_detail += " Latest free cash flow is negative."
+
+    return [
+        {
+            "name": "Current ratio above 1.00",
+            "result": current_ratio_result,
+            "detail": current_ratio_detail,
+        },
+        {
+            "name": "Operating margin above 15.00%",
+            "result": operating_margin_result,
+            "detail": operating_margin_detail,
+        },
+        {
+            "name": "Free cash flow increased year on year",
+            "result": cash_flow_result,
+            "detail": cash_flow_detail,
+        },
+    ]
+
+
 def calculate_risk_metrics(daily_close):
     """Calculate simple one-year risk observations from Yahoo price history."""
     daily_returns = daily_close.pct_change().dropna()
@@ -103,6 +263,21 @@ def get_stock_data(ticker):
     )
 
     info = safe_info(stock)
+    quote_type = info.get("quoteType", "Unknown")
+
+    if str(quote_type).upper() in FUND_TYPES:
+        tilbury_checks = None
+    else:
+        balance_sheet = safe_statement(stock, ["balance_sheet"])
+        income_statement = safe_statement(stock, ["income_stmt", "financials"])
+        cash_flow = safe_statement(stock, ["cashflow", "cash_flow"])
+        tilbury_checks = calculate_tilbury_checks(
+            balance_sheet,
+            income_statement,
+            cash_flow,
+            info.get("currency", "$"),
+        )
+
     daily_close = daily["Close"].dropna()
     latest_price = daily_close.iloc[-1]
     latest_time = daily_close.index[-1]
@@ -139,7 +314,7 @@ def get_stock_data(ticker):
     return {
         "ticker": ticker,
         "name": info.get("longName", info.get("shortName", ticker)),
-        "type": info.get("quoteType", "Unknown"),
+        "type": quote_type,
         "currency": info.get("currency", "$"),
         "latest_price": latest_price,
         "latest_time": latest_time,
@@ -153,88 +328,19 @@ def get_stock_data(ticker):
         "revenue_growth": info.get("revenueGrowth"),
         "debt_to_equity": info.get("debtToEquity"),
         "risk": calculate_risk_metrics(one_year_close),
+        "tilbury_checks": tilbury_checks,
     }
 
 
-def calculate_score(data):
-    """Calculate a transparent Yahoo Finance research score out of 100."""
-    is_fund = str(data["type"]).upper() in FUND_TYPES
-    not_applicable = "Not applicable to a fund or index" if is_fund else None
-
-    checks = [
-        (
-            "50-day average is above 200-day average",
-            bool(data["average_50"] > data["average_200"])
-            if is_number(data["average_50"])
-            and is_number(data["average_200"])
-            else None,
-            25,
-            "Yahoo Finance price history",
-        ),
-        (
-            "One-year price change is positive",
-            bool(data["one_year_return"] > 0)
-            if is_number(data["one_year_return"])
-            else None,
-            15,
-            "Yahoo Finance price history",
-        ),
-        (
-            "Profit margin is at least 10%",
-            bool(number(data["profit_margin"]) >= 0.10)
-            if not is_fund and number(data["profit_margin"]) is not None
-            else None,
-            10,
-            not_applicable or "Yahoo Finance",
-        ),
-        (
-            "Return on equity is at least 15%",
-            bool(number(data["return_on_equity"]) >= 0.15)
-            if not is_fund and number(data["return_on_equity"]) is not None
-            else None,
-            10,
-            not_applicable or "Yahoo Finance",
-        ),
-        (
-            "Debt to equity is no higher than 100",
-            bool(number(data["debt_to_equity"]) <= 100)
-            if not is_fund and number(data["debt_to_equity"]) is not None
-            else None,
-            10,
-            not_applicable or "Yahoo Finance",
-        ),
-        (
-            "Revenue growth is at least 5%",
-            bool(number(data["revenue_growth"]) >= 0.05)
-            if not is_fund and number(data["revenue_growth"]) is not None
-            else None,
-            10,
-            not_applicable or "Yahoo Finance",
-        ),
-        (
-            "P/E ratio is between 0 and 30",
-            bool(0 < number(data["pe_ratio"]) <= 30)
-            if not is_fund and number(data["pe_ratio"]) is not None
-            else None,
-            10,
-            not_applicable or "Yahoo Finance",
-        ),
-    ]
-
-    available_points = sum(
-        points for _, result, points, _ in checks if result is not None
-    )
-    earned_points = sum(
-        points for _, result, points, _ in checks if result is True
-    )
-    score = (earned_points / available_points * 100) if available_points else None
-    return score, checks
+def tilbury_score(checks):
+    """Return passed and available checks for the three quantitative tests."""
+    available_checks = [check for check in checks if check["result"] is not None]
+    passed_checks = [check for check in available_checks if check["result"] is True]
+    return len(passed_checks), len(available_checks)
 
 
-def score_marker(result, source):
-    """Return a short, readable label for a research check."""
-    if source == "Not applicable to a fund or index":
-        return "N/A"
+def tilbury_marker(result):
+    """Return a short, readable label for a quantitative check."""
     if result is True:
         return "PASS"
     if result is False:
@@ -249,24 +355,9 @@ def trend_label(data):
     return "Upward" if data["average_50"] > data["average_200"] else "Downward"
 
 
-def next_steps(checks):
-    """Return neutral, evidence-led subjects to investigate further."""
-    steps = [
-        f"Investigate: {description.lower()}."
-        for description, result, _, _ in checks
-        if result is False
-    ]
-
-    if not steps:
-        steps.append("Read the latest results and compare the company with similar businesses.")
-
-    return steps[:3]
-
-
 def print_report(data):
     """Print a concise Yahoo Finance research report."""
     risk = data["risk"]
-    score, checks = calculate_score(data)
     is_fund = str(data["type"]).upper() in FUND_TYPES
 
     print("\n" + "=" * 68)
@@ -312,34 +403,24 @@ def print_report(data):
         f"  |  Below one-year high: {percentage(risk['current_drawdown'])}"
     )
 
-    relevant_checks = sum(
-        1
-        for _, _, _, source in checks
-        if source != "Not applicable to a fund or index"
-    )
-    checks_with_data = sum(
-        1
-        for _, result, _, source in checks
-        if result is not None and source != "Not applicable to a fund or index"
-    )
-    score_text = f"{score:.0f}/100" if score is not None else "Not available"
+    print("\nMARK TILBURY QUANTITATIVE CHECKS")
+    if is_fund:
+        print("Not applicable: these company financial-statement checks do not suit funds or indexes.")
+    else:
+        checks = data["tilbury_checks"]
+        passed_checks, available_checks = tilbury_score(checks)
+        print(
+            f"Score: {passed_checks}/3 checks passed"
+            f"  |  Data available for {available_checks}/3 checks"
+        )
 
-    print("\nRESEARCH SCREEN")
-    print(
-        f"Score: {score_text}"
-        f"  |  Data available for {checks_with_data}/{relevant_checks} relevant checks"
-    )
-
-    for description, result, _, source in checks:
-        print(f"[{score_marker(result, source):7}] {description} ({source})")
-
-    print("\nWHAT TO CHECK NEXT")
-    for step in next_steps(checks):
-        print(f"- {step}")
+        for check in checks:
+            print(f"[{tilbury_marker(check['result']):7}] {check['name']}")
+            print(f"          {check['detail']}")
 
     print(
-        "\nThis is a research screen, not a buy or sell instruction. "
-        "Read the latest official results before investing."
+        "\nThese are simple financial rules of thumb, not a buy or sell "
+        "instruction. Read the latest official results before investing."
     )
 
 
