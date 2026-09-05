@@ -44,49 +44,41 @@ largest fall from an earlier high (maximum drawdown)
 
 current distance below the one-year high
 
-Produces a transparent research score and shows exactly which checks passed, need attention, or have no data.
+Retrieves annual balance-sheet, income-statement, and cash-flow data where Yahoo Finance provides it.
 
-Suggests neutral topics to investigate next, based on checks that did not pass.
+Produces a three-check quantitative financial score based on the rules of thumb discussed by Mark Tilbury.
 
-For ETFs, mutual funds, and indexes, company-specific measures such as profit margin, debt, and P/E are marked as not applicable. The price, trend, risk, and price-based score checks still work.
+For ETFs, mutual funds, and indexes, company-specific measures such as profit margin, debt, and P/E are marked as not applicable. The Mark Tilbury financial-statement score is also not used, because it is designed for individual companies.
 
-Research score
+Mark Tilbury quantitative checks
 
-The score is a screening aid, not an investment recommendation. It is based on these checks:
+The score is a screening aid, not an investment recommendation. It shows how many of these three financial checks passed:
 
 Check
 
-Points
+Calculation
 
-50-day average above 200-day average
+Pass rule
 
-25
+Current ratio
 
-Positive one-year price change
+Current assets ÷ current liabilities
 
-15
+Above 1.00
 
-Profit margin of at least 10%
+Operating margin
 
-10
+Operating income ÷ total revenue
 
-Return on equity of at least 15%
+Above 15.00%
 
-10
+Free-cash-flow trend
 
-Debt to equity no higher than 100
+Latest annual free cash flow compared with the previous annual figure
 
-10
+Latest figure is higher
 
-Revenue growth of at least 5%
-
-10
-
-P/E ratio between 0 and 30
-
-10
-
-If Yahoo Finance does not have a figure, the program shows NO DATA and leaves that check out of the calculation. This prevents missing figures from being treated as failures. For funds and indexes, the company-only checks are excluded.
+The output shows a score such as 2/3 checks passed, followed by the calculation behind every check. If Yahoo Finance does not provide enough annual financial data, the check shows NO DATA rather than failing. The existing price, trend, P/E, debt, and risk figures remain in the report, but they do not affect this score.
 
 Requirements
 
@@ -159,6 +151,14 @@ Largest fall: the worst fall from a previous high during the last year.
 
 Below one-year high: how far the latest price is below the highest price in that period.
 
+Mark Tilbury quantitative checks
+
+Current ratio: whether the company had enough current assets to cover current liabilities in the latest annual report.
+
+Operating margin: the share of revenue remaining after operating costs in the latest annual report.
+
+Free-cash-flow trend: whether annual free cash flow increased compared with the previous annual report. A negative latest free-cash-flow figure is highlighted for review.
+
 Important limits
 
 Yahoo Finance may provide delayed rather than real-time prices. Always check the timestamp.
@@ -166,6 +166,8 @@ Yahoo Finance may provide delayed rather than real-time prices. Always check the
 One-minute data is often unavailable for funds, indexes, or some exchanges; the program will use the latest daily value instead.
 
 Company figures do not update every minute. They typically change when new financial results are reported.
+
+Yahoo Finance may not provide annual financial statements for every ticker, especially funds, indexes, or some international listings. In that case, a quantitative check will show NO DATA.
 
 A score does not tell you whether to invest. Compare similar investments, review the latest official company or fund documents, and consider your own goals and risk tolerance.
 
