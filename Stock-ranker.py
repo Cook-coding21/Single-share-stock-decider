@@ -159,60 +159,101 @@ def calculate_tilbury_checks(balance_sheet, income_statement, cash_flow, currenc
 
     if current_assets is None or current_liabilities in {None, 0}:
         current_ratio_result = None
-        current_ratio_detail = "Current assets or current liabilities were not available."
+        current_ratio_value = "Not available"
+        current_ratio_reason = (
+            "Yahoo Finance did not provide both current assets and current "
+            "liabilities in the latest annual balance sheet."
+        )
     else:
         current_ratio = current_assets / current_liabilities
         current_ratio_result = bool(current_ratio > 1)
-        current_ratio_detail = f"Current ratio: {current_ratio:.2f} (needs to be above 1.00)."
+        current_ratio_value = (
+            f"{current_ratio:.2f} "
+            f"({money(current_assets, currency)} current assets / "
+            f"{money(current_liabilities, currency)} current liabilities)"
+        )
+        current_ratio_reason = (
+            "Pass: current assets are greater than current liabilities."
+            if current_ratio_result
+            else "Needs review: current liabilities are greater than current assets."
+        )
 
     operating_income = latest_statement_value(income_statement, ["Operating Income"])
     total_revenue = latest_statement_value(income_statement, ["Total Revenue"])
 
     if operating_income is None or total_revenue in {None, 0}:
         operating_margin_result = None
-        operating_margin_detail = "Operating income or total revenue was not available."
+        operating_margin_value = "Not available"
+        operating_margin_reason = (
+            "Yahoo Finance did not provide both operating income and total "
+            "revenue in the latest annual income statement."
+        )
     else:
         operating_margin = operating_income / total_revenue
         operating_margin_result = bool(operating_margin > 0.15)
-        operating_margin_detail = (
-            f"Operating margin: {percentage(operating_margin)} "
-            "(needs to be above 15.00%)."
+        operating_margin_value = (
+            f"{percentage(operating_margin)} "
+            f"({money(operating_income, currency)} operating income / "
+            f"{money(total_revenue, currency)} revenue)"
+        )
+        operating_margin_reason = (
+            "Pass: operating margin is above 15.00%."
+            if operating_margin_result
+            else "Needs review: operating margin is not above 15.00%."
         )
 
     free_cash_flow = free_cash_flow_values(cash_flow)
 
     if len(free_cash_flow) < 2:
         cash_flow_result = None
-        cash_flow_detail = "Two annual free-cash-flow figures were not available."
+        cash_flow_value = "Not available"
+        cash_flow_reason = (
+            "Yahoo Finance did not provide two annual free-cash-flow figures "
+            "to compare."
+        )
     else:
         latest_period, latest_free_cash_flow = free_cash_flow[0]
         previous_period, previous_free_cash_flow = free_cash_flow[1]
         cash_flow_result = bool(latest_free_cash_flow > previous_free_cash_flow)
-        cash_flow_detail = (
-            f"Free cash flow: {money(latest_free_cash_flow, currency)} "
-            f"({period_text(latest_period)}) vs "
+        cash_flow_value = (
+            f"Latest: {money(latest_free_cash_flow, currency)} "
+            f"({period_text(latest_period)}) | Previous: "
             f"{money(previous_free_cash_flow, currency)} "
-            f"({period_text(previous_period)})."
+            f"({period_text(previous_period)})"
+        )
+        cash_flow_reason = (
+            "Pass: latest annual free cash flow is higher than the previous year."
+            if cash_flow_result
+            else "Needs review: latest annual free cash flow did not increase."
         )
 
         if latest_free_cash_flow < 0:
-            cash_flow_detail += " Latest free cash flow is negative."
+            cash_flow_reason += " Latest free cash flow is negative."
 
     return [
         {
-            "name": "Current ratio above 1.00",
+            "section": "BALANCE SHEET",
+            "name": "Current ratio",
             "result": current_ratio_result,
-            "detail": current_ratio_detail,
+            "result_value": current_ratio_value,
+            "pass_rule": "Above 1.00",
+            "reason": current_ratio_reason,
         },
         {
-            "name": "Operating margin above 15.00%",
+            "section": "INCOME STATEMENT",
+            "name": "Operating margin",
             "result": operating_margin_result,
-            "detail": operating_margin_detail,
+            "result_value": operating_margin_value,
+            "pass_rule": "Above 15.00%",
+            "reason": operating_margin_reason,
         },
         {
-            "name": "Free cash flow increased year on year",
+            "section": "CASH FLOW STATEMENT",
+            "name": "Free cash flow trend",
             "result": cash_flow_result,
-            "detail": cash_flow_detail,
+            "result_value": cash_flow_value,
+            "pass_rule": "Latest annual free cash flow is higher than the previous year",
+            "reason": cash_flow_reason,
         },
     ]
 
@@ -414,9 +455,16 @@ def print_report(data):
             f"  |  Data available for {available_checks}/3 checks"
         )
 
+        print("Each check shows: result, pass rule, and explanation.")
+
         for check in checks:
-            print(f"[{tilbury_marker(check['result']):7}] {check['name']}")
-            print(f"          {check['detail']}")
+            print(
+                f"\n[{tilbury_marker(check['result']):7}] "
+                f"{check['section']} — {check['name']}"
+            )
+            print(f"          Result: {check['result_value']}")
+            print(f"          Pass rule: {check['pass_rule']}")
+            print(f"          {check['reason']}")
 
     print(
         "\nThese are simple financial rules of thumb, not a buy or sell "
