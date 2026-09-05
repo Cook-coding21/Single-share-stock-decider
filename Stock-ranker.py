@@ -258,6 +258,280 @@ def calculate_tilbury_checks(balance_sheet, income_statement, cash_flow, currenc
     ]
 
 
+def comparison_values(statement, row_names, years_back=3):
+    """Return the latest and an earlier annual value for a trend comparison."""
+    values = statement_values(statement, row_names)
+
+    if len(values) < 2:
+        return None, None
+
+    earlier_index = min(years_back, len(values) - 1)
+    return values[0], values[earlier_index]
+
+
+def trend_check(
+    section,
+    name,
+    what_it_analyses,
+    values,
+    currency,
+    positive_reason,
+    negative_reason,
+):
+    """Build a transparent latest-versus-earlier-year financial check."""
+    latest, earlier = values
+
+    if latest is None or earlier is None:
+        return {
+            "section": section,
+            "name": name,
+            "what_it_analyses": what_it_analyses,
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Latest annual figure is higher than an earlier annual figure",
+            "reason": "Yahoo Finance did not provide enough annual figures to compare.",
+        }
+
+    latest_period, latest_value = latest
+    earlier_period, earlier_value = earlier
+    result = bool(latest_value > earlier_value)
+
+    if earlier_value != 0:
+        change_text = percentage((latest_value / earlier_value) - 1)
+    else:
+        change_text = "Not available because the earlier figure was zero"
+
+    return {
+        "section": section,
+        "name": name,
+        "what_it_analyses": what_it_analyses,
+        "result": result,
+        "result_value": (
+            f"Latest: {money(latest_value, currency)} ({period_text(latest_period)}) "
+            f"| Earlier: {money(earlier_value, currency)} ({period_text(earlier_period)}) "
+            f"| Change: {change_text}"
+        ),
+        "pass_rule": "Latest annual figure is higher than the earlier annual figure",
+        "reason": positive_reason if result else negative_reason,
+    }
+
+
+def calculate_drew_checks(balance_sheet, income_statement, cash_flow, currency):
+    """Create a Drew Cohen-inspired financial screening checklist.
+
+    The video describes a research process rather than fixed buy rules. These
+    checks turn the observable financial signals he discusses into a clear,
+    first-pass screen; they do not decide whether a stock should be bought.
+    """
+    revenue_values = statement_values(income_statement, ["Total Revenue"])
+    revenue_trend = trend_check(
+        "INCOME STATEMENT",
+        "Revenue trend",
+        "Whether the company is growing sales over time.",
+        comparison_values(income_statement, ["Total Revenue"]),
+        currency,
+        "Favourable: annual revenue is higher than the earlier year.",
+        "Needs review: annual revenue is not higher than the earlier year.",
+    )
+
+    latest_operating_income = latest_statement_value(
+        income_statement,
+        ["Operating Income"],
+    )
+    if latest_operating_income is None:
+        operating_profit = {
+            "section": "INCOME STATEMENT",
+            "name": "Operating profitability",
+            "what_it_analyses": "Whether the core business produced an operating profit in the latest annual report.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Latest annual operating income is positive",
+            "reason": "Yahoo Finance did not provide annual operating income.",
+        }
+    else:
+        operating_profit_result = bool(latest_operating_income > 0)
+        operating_profit = {
+            "section": "INCOME STATEMENT",
+            "name": "Operating profitability",
+            "what_it_analyses": "Whether the core business produced an operating profit in the latest annual report.",
+            "result": operating_profit_result,
+            "result_value": money(latest_operating_income, currency),
+            "pass_rule": "Latest annual operating income is positive",
+            "reason": (
+                "Favourable: the latest annual operating income is positive."
+                if operating_profit_result
+                else "Needs review: the latest annual operating income is negative."
+            ),
+        }
+
+    operating_income_trend = trend_check(
+        "INCOME STATEMENT",
+        "Operating income trend",
+        "Whether profit from the core business is improving over time.",
+        comparison_values(income_statement, ["Operating Income"]),
+        currency,
+        "Favourable: annual operating income is higher than the earlier year.",
+        "Needs review: annual operating income is not higher than the earlier year.",
+    )
+
+    cash = latest_statement_value(
+        balance_sheet,
+        [
+            "Cash Cash Equivalents And Short Term Investments",
+            "Cash And Cash Equivalents",
+            "Cash Financial",
+        ],
+    )
+    total_debt = latest_statement_value(balance_sheet, ["Total Debt"])
+    if cash is None or total_debt is None:
+        debt_and_cash = {
+            "section": "BALANCE SHEET",
+            "name": "Cash versus total debt",
+            "what_it_analyses": "Whether available cash covers the company's reported total debt.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Cash is at least as high as total debt",
+            "reason": "Yahoo Finance did not provide both cash and total debt in the latest annual balance sheet.",
+        }
+    else:
+        net_cash = cash - total_debt
+        debt_and_cash_result = bool(net_cash >= 0)
+        debt_and_cash = {
+            "section": "BALANCE SHEET",
+            "name": "Cash versus total debt",
+            "what_it_analyses": "Whether available cash covers the company's reported total debt.",
+            "result": debt_and_cash_result,
+            "result_value": (
+                f"Cash: {money(cash, currency)} | Debt: {money(total_debt, currency)} "
+                f"| Net cash/(debt): {money(net_cash, currency)}"
+            ),
+            "pass_rule": "Cash is at least as high as total debt",
+            "reason": (
+                "Favourable: the company reports more cash than total debt."
+                if debt_and_cash_result
+                else "Needs review: total debt is higher than reported cash."
+            ),
+        }
+
+    latest_operating_cash_flow = latest_statement_value(
+        cash_flow,
+        [
+            "Operating Cash Flow",
+            "Total Cash From Operating Activities",
+            "Cash Flow From Continuing Operating Activities",
+        ],
+    )
+    if latest_operating_cash_flow is None:
+        operating_cash_flow = {
+            "section": "CASH FLOW STATEMENT",
+            "name": "Operating cash flow",
+            "what_it_analyses": "Whether the core business generated cash in the latest annual report.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Latest annual operating cash flow is positive",
+            "reason": "Yahoo Finance did not provide annual operating cash flow.",
+        }
+    else:
+        operating_cash_flow_result = bool(latest_operating_cash_flow > 0)
+        operating_cash_flow = {
+            "section": "CASH FLOW STATEMENT",
+            "name": "Operating cash flow",
+            "what_it_analyses": "Whether the core business generated cash in the latest annual report.",
+            "result": operating_cash_flow_result,
+            "result_value": money(latest_operating_cash_flow, currency),
+            "pass_rule": "Latest annual operating cash flow is positive",
+            "reason": (
+                "Favourable: the core business generated cash in the latest annual report."
+                if operating_cash_flow_result
+                else "Needs review: the core business did not generate positive annual cash flow."
+            ),
+        }
+
+    free_cash_flow = free_cash_flow_values(cash_flow)
+    if not free_cash_flow:
+        free_cash_flow_check = {
+            "section": "CASH FLOW STATEMENT",
+            "name": "Free cash flow after capital expenditure",
+            "what_it_analyses": "Whether cash remains after the company has funded capital spending.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Latest annual free cash flow is positive",
+            "reason": "Yahoo Finance did not provide enough information to calculate annual free cash flow.",
+        }
+    else:
+        free_cash_flow_period, latest_free_cash_flow = free_cash_flow[0]
+        free_cash_flow_result = bool(latest_free_cash_flow > 0)
+        free_cash_flow_check = {
+            "section": "CASH FLOW STATEMENT",
+            "name": "Free cash flow after capital expenditure",
+            "what_it_analyses": "Whether cash remains after the company has funded capital spending.",
+            "result": free_cash_flow_result,
+            "result_value": (
+                f"{money(latest_free_cash_flow, currency)} "
+                f"({period_text(free_cash_flow_period)})"
+            ),
+            "pass_rule": "Latest annual free cash flow is positive",
+            "reason": (
+                "Favourable: cash remains after capital expenditure."
+                if free_cash_flow_result
+                else "Needs review: free cash flow is negative after capital expenditure."
+            ),
+        }
+
+    revenue_by_period = dict(revenue_values)
+    stock_compensation_values = statement_values(
+        cash_flow,
+        ["Stock Based Compensation", "Stock Based Compensation To Non Employees"],
+    )
+    stock_compensation_ratios = []
+    for period, stock_compensation in stock_compensation_values:
+        revenue = revenue_by_period.get(period)
+        if revenue is not None and revenue > 0:
+            stock_compensation_ratios.append((period, stock_compensation / revenue))
+
+    if len(stock_compensation_ratios) < 2:
+        dilution = {
+            "section": "CASH FLOW STATEMENT",
+            "name": "Stock-based compensation trend",
+            "what_it_analyses": "Whether employee share awards are taking a growing share of revenue, which can dilute shareholders.",
+            "result": None,
+            "result_value": "Not available",
+            "pass_rule": "Stock-based compensation is the same or a smaller share of revenue than the earlier year",
+            "reason": "Yahoo Finance did not provide enough matching annual revenue and stock-compensation figures to compare.",
+        }
+    else:
+        latest_period, latest_ratio = stock_compensation_ratios[0]
+        earlier_index = min(3, len(stock_compensation_ratios) - 1)
+        earlier_period, earlier_ratio = stock_compensation_ratios[earlier_index]
+        dilution_result = bool(latest_ratio <= earlier_ratio)
+        dilution = {
+            "section": "CASH FLOW STATEMENT",
+            "name": "Stock-based compensation trend",
+            "what_it_analyses": "Whether employee share awards are taking a growing share of revenue, which can dilute shareholders.",
+            "result": dilution_result,
+            "result_value": (
+                f"Latest: {percentage(latest_ratio)} of revenue ({period_text(latest_period)}) "
+                f"| Earlier: {percentage(earlier_ratio)} of revenue ({period_text(earlier_period)})"
+            ),
+            "pass_rule": "Stock-based compensation is the same or a smaller share of revenue than the earlier year",
+            "reason": (
+                "Favourable: stock-based compensation is not taking a larger share of revenue."
+                if dilution_result
+                else "Needs review: stock-based compensation is taking a larger share of revenue."
+            ),
+        }
+
+    return [
+        revenue_trend,
+        operating_profit,
+        operating_income_trend,
+        debt_and_cash,
+        operating_cash_flow,
+        free_cash_flow_check,
+        dilution,
+    ]
+
+
 def calculate_risk_metrics(daily_close):
     """Calculate simple one-year risk observations from Yahoo price history."""
     daily_returns = daily_close.pct_change().dropna()
@@ -308,11 +582,18 @@ def get_stock_data(ticker):
 
     if str(quote_type).upper() in FUND_TYPES:
         tilbury_checks = None
+        drew_checks = None
     else:
         balance_sheet = safe_statement(stock, ["balance_sheet"])
         income_statement = safe_statement(stock, ["income_stmt", "financials"])
         cash_flow = safe_statement(stock, ["cashflow", "cash_flow"])
         tilbury_checks = calculate_tilbury_checks(
+            balance_sheet,
+            income_statement,
+            cash_flow,
+            info.get("currency", "$"),
+        )
+        drew_checks = calculate_drew_checks(
             balance_sheet,
             income_statement,
             cash_flow,
@@ -370,6 +651,7 @@ def get_stock_data(ticker):
         "debt_to_equity": info.get("debtToEquity"),
         "risk": calculate_risk_metrics(one_year_close),
         "tilbury_checks": tilbury_checks,
+        "drew_checks": drew_checks,
     }
 
 
@@ -387,6 +669,48 @@ def tilbury_marker(result):
     if result is False:
         return "WATCH"
     return "NO DATA"
+
+
+def print_drew_checklist(checks):
+    """Print the Drew Cohen-inspired checklist with clear analysis labels."""
+    passed_checks, available_checks = tilbury_score(checks)
+
+    print(
+        f"Screening score: {passed_checks}/{len(checks)} favourable checks"
+        f"  |  Data available for {available_checks}/{len(checks)} checks"
+    )
+    print(
+        "This is a first-pass financial screen. It does not include valuation "
+        "or decide whether to buy."
+    )
+
+    for check in checks:
+        print(
+            f"\n[{tilbury_marker(check['result']):7}] "
+            f"{check['section']} — {check['name']}"
+        )
+        print(f"          Analyses: {check['what_it_analyses']}")
+        print(f"          Result: {check['result_value']}")
+        print(f"          Favourable result: {check['pass_rule']}")
+        print(f"          {check['reason']}")
+
+
+def print_drew_valuation_step(data):
+    """Explain the manual valuation work that cannot be scored reliably."""
+    print("\nDREW COHEN VALUATION STEP — MANUAL REVIEW REQUIRED")
+    print(
+        "Analyses: whether the current market price is reasonable versus "
+        "conservative future earnings and cash-flow expectations."
+    )
+    print(
+        f"Available starting figures: P/E {number_text(data['pe_ratio'])}"
+        f"  |  Market value {money(data['market_cap'], data['currency'])}"
+    )
+    print(
+        "Next step: make conservative forecasts for up to three years, then "
+        "use a DCF or reverse DCF. A strong screening score is not a buy signal "
+        "unless the valuation also looks attractive."
+    )
 
 
 def trend_label(data):
@@ -466,6 +790,16 @@ def print_report(data):
             print(f"          Pass rule: {check['pass_rule']}")
             print(f"          {check['reason']}")
 
+    print("\nDREW COHEN-INSPIRED FINANCIAL CHECKLIST")
+    if is_fund:
+        print(
+            "Not applicable: this company financial-statement checklist does "
+            "not suit funds or indexes."
+        )
+    else:
+        print_drew_checklist(data["drew_checks"])
+        print_drew_valuation_step(data)
+
     print(
         "\nThese are simple financial rules of thumb, not a buy or sell "
         "instruction. Read the latest official results before investing."
@@ -497,4 +831,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-#
