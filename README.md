@@ -1,8 +1,8 @@
 # Yahoo Finance Stock Researcher
 
-A simple Python research tool for stocks, ETFs, index funds, and indexes. Enter a ticker symbol, and the program creates a readable report using data returned by Yahoo Finance.
+A simple Python research tool for stocks, ETFs, index funds, and indexes. Enter a ticker symbol and the program creates a readable report using data returned by Yahoo Finance.
 
-This project is for research and learning. It does **not** give buy or sell instructions
+This project is for research and learning. It does **not** give buy or sell instructions.
 
 ## What the program does
 
@@ -28,8 +28,9 @@ For a ticker such as `AAPL`, `MSFT`, `GOOGL`, or `0P00013P6I.L`, the program:
   - current distance below the one-year high
 - Retrieves annual balance-sheet, income-statement, and cash-flow data where Yahoo Finance provides it.
 - Produces a three-check quantitative financial score based on the rules of thumb discussed by Mark Tilbury.
+- Produces a separate seven-check financial screen inspired by Drew Cohen's research process, followed by a manual valuation step.
 
-For ETFs, mutual funds, and indexes, company-specific measures such as profit margin, debt, and P/E are marked as not applicable. The Mark Tilbury financial-statement score is also not used, because it is designed for individual companies.
+For ETFs, mutual funds, and indexes, company-specific measures such as profit margin, debt, and P/E are marked as not applicable. The Mark Tilbury and Drew Cohen financial-statement checks are also not used, because they are designed for individual companies.
 
 ## Mark Tilbury quantitative checks
 
@@ -42,6 +43,26 @@ The score is a screening aid, not an investment recommendation. It shows how man
 | Free-cash-flow trend | Latest annual free cash flow compared with the previous annual figure | Latest figure is higher |
 
 The output shows a score such as `2/3 checks passed`. Each line is labelled **Balance Sheet**, **Income Statement**, or **Cash Flow Statement**, and then shows the result, the pass rule, and a plain-English reason for the pass, review flag, or missing data. If Yahoo Finance does not provide enough annual financial data, the check shows **NO DATA** rather than failing. The existing price, trend, P/E, debt, and risk figures remain in the report, but they do **not** affect this score.
+
+## Drew Cohen-inspired financial checklist
+
+This is a first-pass screen based on the financial signals discussed in Drew Cohen's stock-research process. The video does not provide fixed buy thresholds, so the program marks simple, observable signs as favourable or needing review; it does not treat this as a buy score.
+
+| Financial statement area | Check | What it analyses | Favourable result in this screen |
+| --- | --- | --- | --- |
+| Income Statement | Revenue trend | Whether sales are growing | Latest annual revenue is higher than an earlier annual figure |
+| Income Statement | Operating profitability | Whether the core business makes an operating profit | Latest annual operating income is positive |
+| Income Statement | Operating income trend | Whether core-business profit is improving | Latest annual operating income is higher than an earlier annual figure |
+| Balance Sheet | Cash versus total debt | Whether reported cash covers reported debt | Cash is at least as high as total debt |
+| Cash Flow Statement | Operating cash flow | Whether the business itself generates cash | Latest annual operating cash flow is positive |
+| Cash Flow Statement | Free cash flow after capital expenditure | Whether cash remains after investment spending | Latest annual free cash flow is positive |
+| Cash Flow Statement | Stock-based compensation trend | Whether employee share awards are increasing dilution risk | Stock-based compensation is the same or a smaller share of revenue than an earlier year |
+
+Every line states what it analyses, the result, the favourable result, and a plain-English explanation. **NO DATA** means Yahoo Finance did not return the annual figures needed for that check.
+
+### Valuation is a separate manual step
+
+The program displays the current P/E and market value but deliberately does not give them a pass or fail. To follow the valuation part of the process, make conservative revenue, earnings, and cash-flow forecasts for up to three years and then use a DCF or reverse DCF. A high financial-screening score alone is not a buy signal.
 
 ## Requirements
 
