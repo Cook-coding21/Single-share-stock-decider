@@ -29,8 +29,10 @@ For a ticker such as `AAPL`, `MSFT`, `GOOGL`, or `0P00013P6I.L`, the program:
 - Retrieves annual balance-sheet, income-statement, and cash-flow data where Yahoo Finance provides it.
 - Produces a three-check quantitative financial score based on the rules of thumb discussed by Mark Tilbury.
 - Produces a separate seven-check financial screen inspired by Drew Cohen's research process, followed by a manual valuation step.
+- Produces a separate six-check financial screen inspired by Richard Coffin / The Plain Bagel's research process, followed by manual valuation and peer-comparison steps.
+- Summarises the three company frameworks in an overall financial-research score at the end of the report.
 
-For ETFs, mutual funds, and indexes, company-specific measures such as profit margin, debt, and P/E are marked as not applicable. The Mark Tilbury and Drew Cohen financial-statement checks are also not used, because they are designed for individual companies.
+For ETFs, mutual funds, and indexes, company-specific measures such as profit margin, debt, and P/E are marked as not applicable. The Mark Tilbury, Drew Cohen, and Plain Bagel financial-statement checks are also not used, because they are designed for individual companies.
 
 ## Mark Tilbury quantitative checks
 
@@ -63,6 +65,27 @@ Every line states what it analyses, the result, the favourable result, and a pla
 ### Valuation is a separate manual step
 
 The program displays the current P/E and market value but deliberately does not give them a pass or fail. To follow the valuation part of the process, make conservative revenue, earnings, and cash-flow forecasts for up to three years and then use a DCF or reverse DCF. A high financial-screening score alone is not a buy signal.
+
+## Plain Bagel / Richard Coffin financial checklist
+
+This framework follows the financial-analysis stages described in [The Plain Bagel's research video](https://www.youtube.com/watch?v=kXYvRR7gV2E). It is an adaptation, not Richard Coffin's private scoring method. Yahoo Finance normally provides only a few annual financial statements, so the script uses the longest available annual history rather than claiming to replicate a full 5-, 10-, or 15-year analysis.
+
+| Financial statement area | Check | What it analyses | Favourable result in this screen |
+| --- | --- | --- | --- |
+| Income Statement | Revenue CAGR | Long-term annualised sales growth | Positive annualised growth across the available history |
+| Income Statement | Operating-income CAGR | Long-term annualised core-profit growth | Positive annualised growth across the available history |
+| Income Statement | Operating-cost share trend | Whether operating costs are taking more of each pound/dollar of revenue | Costs are the same or a smaller share of revenue than earlier |
+| Balance Sheet | Net cash/(debt) trend | Whether cash relative to total debt is improving | Net cash/(debt) is better than or equal to an earlier year |
+| Income Statement + Balance Sheet | Return-on-equity history | Whether profit has been positive relative to shareholder equity | Positive average annual return on ending equity |
+| Cash Flow Statement | Capital-expenditure coverage | Whether operating cash flow covers investment spending | Operating cash flow is greater than capital expenditure |
+
+It also prints a separate manual step for peer comparison and valuation. Use it to compare valuation multiples with similar companies and the company's own history, then test conservative assumptions with a DCF. Those decisions cannot be safely reduced to an automatic pass/fail rule.
+
+## Overall financial-research score
+
+At the end of each company report, the script shows the percentage of available checks that were favourable for each framework, then calculates an **equal-weight average** of the Mark Tilbury, Drew Cohen, and Plain Bagel percentages.
+
+Missing Yahoo Finance data is excluded from a framework's percentage rather than counted as a failure. The frameworks contain related checks, so the overall result is only a quick research summary—**not** a buy score or investment recommendation. Business quality, strategy, peer comparison, valuation, diversification, and your own risk tolerance still need manual review.
 
 ## Requirements
 
