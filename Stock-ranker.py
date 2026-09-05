@@ -5,13 +5,27 @@ This script uses Yahoo Finance only. It is a research tool, not a buy or sell
 recommendation.
 """
 
+import json
 import math
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import yfinance as yf
 
 
 FUND_TYPES = {"ETF", "MUTUALFUND", "INDEX"}
 SECTOR_SPECIFIC_SCORE_SECTORS = {"FINANCIAL SERVICES", "REAL ESTATE"}
+
+# Screening every S&P 500 company needs many Yahoo Finance requests. Financial
+# statements change after results are released, not minute by minute, so reuse a
+# score for one day by default. The live S&P 500 and Most Active lists are still
+# retrieved fresh on every screen run, and the menu offers a force-refresh.
+SCREEN_CACHE_FILE = Path(__file__).with_name("stock_screener_cache.json")
+SCREEN_CACHE_MAX_AGE = timedelta(hours=24)
+SCREEN_REQUEST_DELAY_SECONDS = 0.15
+DEFAULT_SCREEN_RESULTS = 15
+MAX_SCREEN_RESULTS = 50
 
 
 # These weights are for a first-pass financial-quality screen, not a prediction
@@ -997,6 +1011,368 @@ def calculate_risk_metrics(daily_close):
     }
 
 
+def utc_timestamp():
+    """Return a timezone-aware timestamp for the screener cache."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_screen_cache():
+    """Load prior financial-screen summaries without failing the program."""
+    try:
+        with SCREEN_CACHE_FILE.open("r", encoding="utf-8") as cache_file:
+            cache = json.load(cache_file)
+        records = cache.get("records", {})
+        return records if isinstance(records, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_screen_cache(records):
+    """Save the reusable score summaries safely beside this script."""
+    temporary_file = SCREEN_CACHE_FILE.with_suffix(".tmp")
+    try:
+        with temporary_file.open("w", encoding="utf-8") as cache_file:
+            json.dump({"records": records}, cache_file, indent=2, sort_keys=True)
+        temporary_file.replace(SCREEN_CACHE_FILE)
+    except OSError:
+        try:
+            temporary_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def cached_record_is_fresh(record):
+    """Return True only when a cached financial score is less than one day old."""
+    try:
+        updated_at = datetime.fromisoformat(record["financial_data_checked_at"])
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)
+        return timedelta(0) <= age <= SCREEN_CACHE_MAX_AGE
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def normalise_yahoo_ticker(value):
+    """Convert a component-list ticker into Yahoo Finance ticker format."""
+    ticker = str(value).strip().upper()
+    if not ticker or ticker in {"NAN", "NONE", "NULL", "-"}:
+        return ""
+    return ticker.replace(".", "-")
+
+
+def tickers_from_table(table):
+    """Extract tickers from a Yahoo Finance table or DataFrame-like object."""
+    if table is None or getattr(table, "empty", False):
+        return []
+
+    columns = list(getattr(table, "columns", []))
+    for column in ("symbol", "Symbol", "ticker", "Ticker"):
+        if column in columns:
+            try:
+                return [
+                    normalise_yahoo_ticker(value)
+                    for value in table[column].tolist()
+                    if normalise_yahoo_ticker(value)
+                ]
+            except (KeyError, AttributeError, TypeError):
+                continue
+
+    try:
+        return [
+            normalise_yahoo_ticker(value)
+            for value in table.index.tolist()
+            if normalise_yahoo_ticker(value)
+        ]
+    except (AttributeError, TypeError):
+        return []
+
+
+def get_sp500_tickers():
+    """Get the current S&P 500 component list from Yahoo Finance."""
+    index = yf.Ticker("^GSPC")
+    components = getattr(index, "components", None)
+    if callable(components):
+        components = components()
+
+    tickers = tickers_from_table(components)
+    if not tickers:
+        raise RuntimeError(
+            "Yahoo Finance did not return the current S&P 500 components. "
+            "Update yfinance with: pip install --upgrade yfinance, then try again."
+        )
+
+    return list(dict.fromkeys(tickers))
+
+
+def get_most_active_tickers(limit=25):
+    """Get Yahoo Finance's current US Most Active stock list."""
+    screen = getattr(yf, "screen", None)
+    if screen is None:
+        raise RuntimeError(
+            "This yfinance version cannot load Yahoo Finance screens. "
+            "Update it with: pip install --upgrade yfinance"
+        )
+
+    response = screen("most_actives", count=min(limit, 250))
+    quotes = response.get("quotes", []) if isinstance(response, dict) else []
+    tickers = []
+    for quote in quotes:
+        if not isinstance(quote, dict):
+            continue
+        ticker = normalise_yahoo_ticker(quote.get("symbol", ""))
+        if ticker:
+            tickers.append(ticker)
+
+    if not tickers:
+        raise RuntimeError(
+            "Yahoo Finance did not return any Most Active stocks. Try again "
+            "during US market hours or later today."
+        )
+
+    return list(dict.fromkeys(tickers))
+
+
+def get_screening_data(ticker):
+    """Get only the financial data needed for a fast weighted-score screen."""
+    ticker = normalise_yahoo_ticker(ticker)
+    if not ticker:
+        raise ValueError("Yahoo Finance returned an invalid ticker symbol.")
+
+    stock = yf.Ticker(ticker)
+    info = safe_info(stock)
+    quote_type = str(info.get("quoteType", "Unknown"))
+
+    if quote_type.upper() in FUND_TYPES:
+        raise ValueError("This is a fund or index, not an individual company.")
+
+    currency = info.get("currency", "$")
+    balance_sheet = safe_statement(stock, ["balance_sheet"])
+    income_statement = safe_statement(stock, ["income_stmt", "financials"])
+    cash_flow = safe_statement(stock, ["cashflow", "cash_flow"])
+
+    return {
+        "ticker": ticker,
+        "name": info.get("longName", info.get("shortName", ticker)),
+        "sector": info.get("sector", "Not available"),
+        "currency": currency,
+        "tilbury_checks": calculate_tilbury_checks(
+            balance_sheet, income_statement, cash_flow, currency
+        ),
+        "drew_checks": calculate_drew_checks(
+            balance_sheet, income_statement, cash_flow, currency
+        ),
+        "plain_bagel_checks": calculate_plain_bagel_checks(
+            balance_sheet, income_statement, cash_flow, currency
+        ),
+    }
+
+
+def is_screen_candidate(summary):
+    """Apply the same high-score safeguards used in the full stock report."""
+    return bool(
+        summary["score"] is not None
+        and summary["score"] >= 70
+        and summary["data_coverage"] >= 85
+        and not summary["high_priority_failures"]
+        and not summary["high_priority_missing"]
+    )
+
+
+def make_screen_record(ticker):
+    """Create the compact, cacheable result for one company's financial screen."""
+    data = get_screening_data(ticker)
+    summary = weighted_financial_score(data)
+    score = summary["score"]
+
+    if score is None:
+        raise ValueError("Yahoo Finance did not provide usable weighted financial data.")
+
+    return {
+        "ticker": data["ticker"],
+        "name": str(data["name"]),
+        "sector": str(data["sector"]),
+        "score": score,
+        "data_coverage": summary["data_coverage"],
+        "high_priority_failures": summary["high_priority_failures"],
+        "high_priority_missing": summary["high_priority_missing"],
+        "status": financial_screen_label(
+            score,
+            summary["data_coverage"],
+            summary["high_priority_failures"],
+            summary["high_priority_missing"],
+        ),
+        "candidate": is_screen_candidate(summary),
+        "financial_data_checked_at": utc_timestamp(),
+    }
+
+
+def add_source_tickers(ticker_sources, tickers, source_name):
+    """Keep each ticker once while recording which fresh list included it."""
+    for ticker in tickers:
+        ticker_sources.setdefault(ticker, []).append(source_name)
+
+
+def screen_result_status(record):
+    """Return a short status that keeps the results table easy to read."""
+    if record["candidate"]:
+        return "RESEARCH CANDIDATE"
+    if record["high_priority_failures"]:
+        return "CORE CONCERN"
+    if record["high_priority_missing"] or record["data_coverage"] < 85:
+        return "INCOMPLETE"
+    return "MIXED"
+
+
+def print_screening_results(records, failed_count, fresh_count, cached_count, top_count):
+    """Print only the strongest matches for the user's financial model."""
+    candidates = sorted(
+        (record for record in records if record["candidate"]),
+        key=lambda record: (-record["score"], -record["data_coverage"], record["ticker"]),
+    )
+
+    print("\n" + "=" * 84)
+    print("STOCK SCREENER — STRONGEST MATCHES FOR YOUR FINANCIAL MODEL")
+    print("=" * 84)
+    print(
+        f"Live stock lists refreshed: {utc_timestamp()} | "
+        f"Companies scored: {len(records)} | Could not score: {failed_count}"
+    )
+    print(
+        f"Financial scores used: {fresh_count} refreshed now, {cached_count} "
+        "reused from the last 24 hours"
+    )
+    print(
+        "A research candidate needs: score 70+; at least 85% weighted data "
+        "coverage; and no failed or missing high-priority check."
+    )
+
+    if not candidates:
+        print(
+            "\nNo company cleared every safeguard in this run. This does not "
+            "mean there are no good investments; it means none currently fit "
+            "all of your financial rules with sufficiently complete Yahoo data."
+        )
+        return
+
+    print("\nTOP RESEARCH CANDIDATES — NOT BUY RECOMMENDATIONS")
+    print(
+        f"{'#':<4}{'Ticker':<9}{'Score':>7}  {'Data':>7}  {'Sector':<22}  Company"
+    )
+    print("-" * 84)
+    for rank, record in enumerate(candidates[:top_count], start=1):
+        sector = record["sector"][:22]
+        name = record["name"][:31]
+        print(
+            f"{rank:<4}{record['ticker']:<9}{record['score']:>6.0f}/100  "
+            f"{record['data_coverage']:>5.0f}%  {sector:<22}  {name}"
+        )
+
+    if len(candidates) > top_count:
+        print(f"\nShowing the top {top_count} of {len(candidates)} research candidates.")
+
+    print(
+        "\nNext step: research an individual ticker from this list to see the "
+        "full checklist, valuation prompts, downside evidence, and risks."
+    )
+    print(
+        "The ranking identifies the strongest matches for your historical "
+        "financial model. It cannot decide whether a share is fairly valued or "
+        "will outperform."
+    )
+
+
+def screen_stock_universe(ticker_sources, top_count, force_refresh=False):
+    """Score a live stock universe and rank the strongest research candidates."""
+    cache = load_screen_cache()
+    scored_records = []
+    failed_count = 0
+    fresh_count = 0
+    cached_count = 0
+    total = len(ticker_sources)
+
+    print(
+        f"\nScreening {total} companies. The first full S&P 500 screen can take "
+        "several minutes because Yahoo financial statements are checked company by company."
+    )
+
+    for position, (ticker, sources) in enumerate(ticker_sources.items(), start=1):
+        if position == 1 or position == total or position % 25 == 0:
+            print(f"Progress: {position}/{total} companies checked...")
+
+        cached_record = cache.get(ticker)
+        if not force_refresh and cached_record_is_fresh(cached_record):
+            record = dict(cached_record)
+            cached_count += 1
+        else:
+            try:
+                record = make_screen_record(ticker)
+                cache[ticker] = record
+                fresh_count += 1
+                time.sleep(SCREEN_REQUEST_DELAY_SECONDS)
+            except Exception:
+                failed_count += 1
+                continue
+
+        record["sources"] = list(sources)
+        scored_records.append(record)
+
+    save_screen_cache(cache)
+    print_screening_results(
+        scored_records, failed_count, fresh_count, cached_count, top_count
+    )
+
+
+def read_screen_result_count():
+    """Ask for a sensible number of ranked screen results."""
+    response = input(
+        f"How many top research candidates should be shown? "
+        f"[default {DEFAULT_SCREEN_RESULTS}, maximum {MAX_SCREEN_RESULTS}]: "
+    ).strip()
+    if not response:
+        return DEFAULT_SCREEN_RESULTS
+    try:
+        return max(1, min(int(response), MAX_SCREEN_RESULTS))
+    except ValueError:
+        print(f"Using the default of {DEFAULT_SCREEN_RESULTS} results.")
+        return DEFAULT_SCREEN_RESULTS
+
+
+def should_force_screen_refresh():
+    """Let the user choose accuracy now versus a much quicker cached screen."""
+    response = input(
+        "Refresh every company financial score now? This can take much longer. [y/N]: "
+    ).strip().lower()
+    return response in {"y", "yes"}
+
+
+def run_stock_screener(choice):
+    """Build the selected live universe and run the weighted financial screen."""
+    ticker_sources = {}
+
+    try:
+        if choice in {"2", "4"}:
+            sp500_tickers = get_sp500_tickers()
+            add_source_tickers(ticker_sources, sp500_tickers, "S&P 500")
+            print(f"Loaded {len(sp500_tickers)} current S&P 500 ticker listings from Yahoo Finance.")
+
+        if choice in {"3", "4"}:
+            active_tickers = get_most_active_tickers()
+            add_source_tickers(ticker_sources, active_tickers, "Yahoo Most Active")
+            print(f"Loaded {len(active_tickers)} current Yahoo Finance Most Active stocks.")
+    except Exception as error:
+        print(f"\nCould not build the live screen list: {error}")
+        return
+
+    if not ticker_sources:
+        print("\nNo companies were available to screen.")
+        return
+
+    top_count = read_screen_result_count()
+    force_refresh = should_force_screen_refresh()
+    screen_stock_universe(ticker_sources, top_count, force_refresh)
+
+
 def get_stock_data(ticker):
     """Retrieve Yahoo Finance price history and company data for one ticker."""
     ticker = ticker.strip().upper()
@@ -1693,17 +2069,34 @@ def research_stock(ticker):
 
 def main():
     print("Yahoo Finance Stock Researcher")
-    print("Type a ticker such as AAPL, MSFT, GOOGL, or 0P00013P6I.L.")
-    print("Type 'quit' to close the program.")
+    print("Research individual companies or screen live US stock lists.")
 
     while True:
-        ticker = input("\nWhich investment would you like to research? ")
+        print("\n1. Research one ticker")
+        print("2. Screen the current S&P 500")
+        print("3. Screen Yahoo Finance's current Most Active stocks")
+        print("4. Screen both lists together (duplicates removed)")
+        print("5. Clear saved screener scores")
+        print("Q. Quit")
+        choice = input("\nChoose an option: ").strip().lower()
 
-        if ticker.strip().lower() in {"quit", "exit", "q"}:
+        if choice in {"quit", "exit", "q"}:
             print("Goodbye.")
             break
 
-        research_stock(ticker)
+        if choice == "1":
+            ticker = input("\nEnter a ticker such as AAPL, MSFT, GOOGL, or VWRP.L: ")
+            research_stock(ticker)
+        elif choice in {"2", "3", "4"}:
+            run_stock_screener(choice)
+        elif choice == "5":
+            try:
+                SCREEN_CACHE_FILE.unlink(missing_ok=True)
+                print("Saved screener scores cleared. The next screen will fetch fresh financial data.")
+            except OSError as error:
+                print(f"Could not clear the screener cache: {error}")
+        else:
+            print("Please choose 1, 2, 3, 4, 5, or Q.")
 
 
 if __name__ == "__main__":
