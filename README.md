@@ -1,8 +1,8 @@
 # Yahoo Finance Stock Researcher
 
-A simple Python research tool for stocks, ETFs, index funds, and indexes. Enter a ticker symbol and the program creates a readable report using data returned by Yahoo Finance.
+A simple Python research tool for stocks, ETFs, index funds, and indexes. Enter a ticker symbol, and the program creates a readable report using data returned by Yahoo Finance.
 
-This project is for research and learning. It does **not** give buy or sell instructions.
+This project is for research and learning. It does **not** give buy or sell instructions
 
 ## What the program does
 
