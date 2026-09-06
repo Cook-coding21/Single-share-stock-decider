@@ -10,6 +10,7 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 
 import yfinance as yf
 
@@ -40,6 +41,39 @@ EMERGING_MAX_MARKET_CAP = 2_000_000_000
 EMERGING_MIN_PRICE = 2.00
 EMERGING_MIN_DAY_VOLUME = 200_000
 EMERGING_MIN_AVERAGE_VOLUME = 250_000
+
+
+# Valuation assumptions. They are intentionally visible and easy to change,
+# because a valuation is only as useful as its assumptions. These are generic
+# US-market starting points, not live market rates or a price target.
+DCF_FORECAST_YEARS = 5
+RISK_FREE_RATE_ASSUMPTION = 0.04
+EQUITY_RISK_PREMIUM_ASSUMPTION = 0.05
+DEFAULT_PRE_TAX_COST_OF_DEBT = 0.055
+DEFAULT_TAX_RATE = 0.21
+TERMINAL_GROWTH_RATE = 0.025
+DCF_MIN_BASE_GROWTH = -0.02
+DCF_MAX_BASE_GROWTH = 0.10
+DCF_BEAR_GROWTH_ADJUSTMENT = 0.04
+DCF_BULL_GROWTH_ADJUSTMENT = 0.04
+DCF_SCENARIO_DISCOUNT_ADJUSTMENT = 0.01
+DDM_DIVIDEND_GROWTH_ASSUMPTION = 0.025
+# The valuation verdict deliberately requires a margin outside the modelled
+# value before it calls a share potentially under- or over-valued. This avoids
+# treating a small model difference as a precise investing signal.
+VALUATION_BUFFER = 0.15
+
+# Banks, insurers and REITs need sector-specific valuation inputs. The program
+# will use a dividend or asset check where possible, rather than forcing a
+# generic FCFF DCF onto them.
+DCF_UNSUITABLE_SECTORS = {"FINANCIAL SERVICES", "REAL ESTATE"}
+ASSET_VALUE_SECTORS = {
+    "BASIC MATERIALS",
+    "ENERGY",
+    "FINANCIAL SERVICES",
+    "REAL ESTATE",
+    "UTILITIES",
+}
 
 
 # These weights are for a first-pass financial-quality screen, not a prediction
@@ -1677,6 +1711,785 @@ def run_stock_screener(choice):
     )
 
 
+def clamp(value, lower, upper):
+    """Keep a numeric assumption inside a transparent, stated range."""
+    return max(lower, min(float(value), upper))
+
+
+def period_value(values_by_period, period):
+    """Return a statement value for the matching annual period when available."""
+    value = values_by_period.get(period)
+    return number(value)
+
+
+def annual_tax_rate(income_statement, period=None):
+    """Estimate an effective tax rate from annual financial-statement data."""
+    tax_by_period = dict(
+        statement_values(
+            income_statement,
+            ["Tax Provision", "Tax Expense", "Provision For Income Taxes"],
+        )
+    )
+    pretax_by_period = dict(
+        statement_values(
+            income_statement,
+            ["Pretax Income", "Pre Tax Income", "Income Before Tax"],
+        )
+    )
+
+    periods = [period] if period is not None else tax_by_period.keys()
+    for candidate_period in periods:
+        tax = period_value(tax_by_period, candidate_period)
+        pretax = period_value(pretax_by_period, candidate_period)
+
+        if tax is None or pretax is None or pretax <= 0:
+            continue
+
+        rate = abs(tax) / pretax
+        if 0 <= rate <= 0.50:
+            return rate, "latest reported tax provision"
+
+    return DEFAULT_TAX_RATE, "default tax-rate assumption"
+
+
+def calculate_fcff_history(income_statement, cash_flow):
+    """Build a conservative FCFF history from Yahoo Finance annual statements.
+
+    FCFF = EBIT after tax + depreciation/amortisation - capital expenditure
+    + change in working capital. A missing working-capital entry is treated as
+    zero but clearly flagged in the report; missing EBIT, D&A or capex prevents
+    that year from being used.
+    """
+    ebit_values = statement_values(income_statement, ["Operating Income"])
+    depreciation_by_period = dict(
+        statement_values(
+            cash_flow,
+            [
+                "Depreciation And Amortization",
+                "Depreciation",
+                "Depreciation And Amortization In Cash Flow Statement",
+            ],
+        )
+    )
+    capex_by_period = dict(
+        statement_values(cash_flow, ["Capital Expenditure", "Capital Expenditures"])
+    )
+    working_capital_by_period = dict(
+        statement_values(
+            cash_flow,
+            [
+                "Change In Working Capital",
+                "Change In Other Working Capital",
+                "Change In Net Working Capital",
+            ],
+        )
+    )
+    history = []
+
+    for period, ebit in ebit_values:
+        depreciation = period_value(depreciation_by_period, period)
+        capex = period_value(capex_by_period, period)
+
+        if depreciation is None or capex is None:
+            continue
+
+        tax_rate, tax_source = annual_tax_rate(income_statement, period)
+        working_capital = period_value(working_capital_by_period, period)
+        working_capital_available = working_capital is not None
+        working_capital = working_capital if working_capital_available else 0.0
+        fcff = ebit * (1 - tax_rate) + depreciation - abs(capex) + working_capital
+
+        history.append(
+            {
+                "period": period,
+                "fcff": fcff,
+                "tax_rate": tax_rate,
+                "tax_source": tax_source,
+                "working_capital_available": working_capital_available,
+            }
+        )
+
+    return history
+
+
+def historical_cash_flow_growth(fcff_history):
+    """Return annualised FCFF growth where the available history supports it."""
+    if len(fcff_history) < 2:
+        return None
+
+    latest = fcff_history[0]
+    earlier = fcff_history[-1]
+    latest_value = latest["fcff"]
+    earlier_value = earlier["fcff"]
+    years = years_between_periods(latest["period"], earlier["period"])
+
+    if years is None or years <= 0 or latest_value <= 0 or earlier_value <= 0:
+        return None
+
+    return (latest_value / earlier_value) ** (1 / years) - 1
+
+
+def shares_outstanding_for_valuation(data):
+    """Use reported shares, falling back to market value divided by price."""
+    reported_shares = number(data.get("shares_outstanding"))
+    if reported_shares is not None and reported_shares > 0:
+        return reported_shares, "reported shares outstanding"
+
+    market_cap = number(data.get("market_cap"))
+    latest_price = number(data.get("latest_price"))
+    if market_cap is not None and latest_price is not None and latest_price > 0:
+        return market_cap / latest_price, "market value divided by current price"
+
+    return None, "shares outstanding were not available"
+
+
+def calculate_cost_of_capital(data):
+    """Estimate a transparent WACC from capital structure and stated inputs."""
+    market_cap = number(data.get("market_cap"))
+    total_debt = latest_statement_value(data["balance_sheet"], ["Total Debt"])
+    cash = latest_statement_value(
+        data["balance_sheet"],
+        [
+            "Cash Cash Equivalents And Short Term Investments",
+            "Cash And Cash Equivalents",
+            "Cash Financial",
+        ],
+    )
+    total_debt = total_debt if total_debt is not None and total_debt >= 0 else 0.0
+    cash = cash if cash is not None and cash >= 0 else 0.0
+    beta = number(data.get("beta"))
+    beta = beta if beta is not None and beta > 0 else 1.0
+    beta_source = "Yahoo Finance beta" if is_number(data.get("beta")) else "beta of 1.00 assumption"
+
+    tax_rate, tax_source = annual_tax_rate(data["income_statement"])
+    interest_expense = latest_statement_value(
+        data["income_statement"],
+        ["Interest Expense Non Operating", "Interest Expense"],
+    )
+    pre_tax_cost_of_debt = DEFAULT_PRE_TAX_COST_OF_DEBT
+    debt_cost_source = "default pre-tax cost-of-debt assumption"
+    if (
+        interest_expense is not None
+        and total_debt > 0
+        and 0 < abs(interest_expense) / total_debt <= 0.20
+    ):
+        pre_tax_cost_of_debt = abs(interest_expense) / total_debt
+        debt_cost_source = "latest interest expense divided by total debt"
+
+    cost_of_equity = (
+        RISK_FREE_RATE_ASSUMPTION + beta * EQUITY_RISK_PREMIUM_ASSUMPTION
+    )
+
+    if market_cap is None or market_cap <= 0:
+        return {
+            "available": False,
+            "reason": "Market value was not available, so WACC could not be estimated.",
+            "cost_of_equity": cost_of_equity,
+            "tax_rate": tax_rate,
+            "tax_source": tax_source,
+            "beta_source": beta_source,
+        }
+
+    total_capital = market_cap + total_debt
+    equity_weight = market_cap / total_capital
+    debt_weight = total_debt / total_capital
+    wacc = (
+        equity_weight * cost_of_equity
+        + debt_weight * pre_tax_cost_of_debt * (1 - tax_rate)
+    )
+
+    if not 0.04 < wacc < 0.30:
+        return {
+            "available": False,
+            "reason": "The estimated WACC was outside a usable range; check the source data.",
+            "cost_of_equity": cost_of_equity,
+            "tax_rate": tax_rate,
+            "tax_source": tax_source,
+            "beta_source": beta_source,
+        }
+
+    return {
+        "available": True,
+        "wacc": wacc,
+        "cost_of_equity": cost_of_equity,
+        "pre_tax_cost_of_debt": pre_tax_cost_of_debt,
+        "debt_cost_source": debt_cost_source,
+        "tax_rate": tax_rate,
+        "tax_source": tax_source,
+        "beta": beta,
+        "beta_source": beta_source,
+        "market_cap": market_cap,
+        "total_debt": total_debt,
+        "cash": cash,
+    }
+
+
+def calculate_dcf_scenario(
+    starting_fcff,
+    cash_flow_growth,
+    discount_rate,
+    cash,
+    debt,
+    shares_outstanding,
+):
+    """Calculate one five-year FCFF DCF scenario and its value per share."""
+    if (
+        starting_fcff <= 0
+        or discount_rate <= TERMINAL_GROWTH_RATE
+        or shares_outstanding <= 0
+    ):
+        return None
+
+    present_value = 0.0
+    forecast_fcff = starting_fcff
+
+    for year in range(1, DCF_FORECAST_YEARS + 1):
+        forecast_fcff *= 1 + cash_flow_growth
+        present_value += forecast_fcff / ((1 + discount_rate) ** year)
+
+    terminal_value = (
+        forecast_fcff * (1 + TERMINAL_GROWTH_RATE)
+    ) / (discount_rate - TERMINAL_GROWTH_RATE)
+    present_value += terminal_value / ((1 + discount_rate) ** DCF_FORECAST_YEARS)
+    equity_value = present_value + cash - debt
+
+    if equity_value <= 0:
+        return None
+
+    return {
+        "enterprise_value": present_value,
+        "equity_value": equity_value,
+        "value_per_share": equity_value / shares_outstanding,
+        "cash_flow_growth": cash_flow_growth,
+        "discount_rate": discount_rate,
+    }
+
+
+def calculate_dcf_valuation(data, capital):
+    """Create cautious/base/optimistic FCFF DCF values for suitable companies."""
+    sector = str(data.get("sector", "")).upper()
+    if sector in DCF_UNSUITABLE_SECTORS:
+        return {
+            "available": False,
+            "reason": (
+                "A generic FCFF DCF is not used for this sector. Its debt and "
+                "cash flows need sector-specific treatment."
+            ),
+        }
+
+    if not capital.get("available"):
+        return {"available": False, "reason": capital["reason"]}
+
+    fcff_history = calculate_fcff_history(
+        data["income_statement"],
+        data["cash_flow"],
+    )
+    if len(fcff_history) < 2:
+        return {
+            "available": False,
+            "reason": "At least two years of EBIT, depreciation and capital-expenditure data are needed.",
+        }
+
+    recent_fcff = fcff_history[:3]
+    if any(entry["fcff"] <= 0 for entry in recent_fcff[:2]):
+        return {
+            "available": False,
+            "reason": "The latest two FCFF years were not both positive, so a stable cash-flow DCF would be misleading.",
+        }
+
+    shares_outstanding, shares_source = shares_outstanding_for_valuation(data)
+    if shares_outstanding is None:
+        return {"available": False, "reason": shares_source}
+
+    historical_growth = historical_cash_flow_growth(recent_fcff)
+    base_growth = clamp(
+        historical_growth if historical_growth is not None else 0.03,
+        DCF_MIN_BASE_GROWTH,
+        DCF_MAX_BASE_GROWTH,
+    )
+    scenarios = {
+        "Cautious": (
+            max(DCF_MIN_BASE_GROWTH - DCF_BEAR_GROWTH_ADJUSTMENT, base_growth - DCF_BEAR_GROWTH_ADJUSTMENT),
+            capital["wacc"] + DCF_SCENARIO_DISCOUNT_ADJUSTMENT,
+        ),
+        "Base": (base_growth, capital["wacc"]),
+        "Optimistic": (
+            min(DCF_MAX_BASE_GROWTH + DCF_BULL_GROWTH_ADJUSTMENT, base_growth + DCF_BULL_GROWTH_ADJUSTMENT),
+            max(TERMINAL_GROWTH_RATE + 0.01, capital["wacc"] - DCF_SCENARIO_DISCOUNT_ADJUSTMENT),
+        ),
+    }
+    scenario_values = {}
+    starting_fcff = median([entry["fcff"] for entry in recent_fcff])
+
+    for name, (growth, discount_rate) in scenarios.items():
+        result = calculate_dcf_scenario(
+            starting_fcff,
+            growth,
+            discount_rate,
+            capital["cash"],
+            capital["total_debt"],
+            shares_outstanding,
+        )
+        if result is None:
+            return {
+                "available": False,
+                "reason": "The DCF assumptions did not produce a usable equity value.",
+            }
+        scenario_values[name] = result
+
+    working_capital_missing_years = sum(
+        not entry["working_capital_available"] for entry in recent_fcff
+    )
+    return {
+        "available": True,
+        "scenarios": scenario_values,
+        "starting_fcff": starting_fcff,
+        "fcff_history": recent_fcff,
+        "historical_growth": historical_growth,
+        "base_growth": base_growth,
+        "shares_source": shares_source,
+        "working_capital_missing_years": working_capital_missing_years,
+    }
+
+
+def calculate_ddm_valuation(data, capital):
+    """Calculate a Gordon-growth dividend value for sustainable dividend payers."""
+    dividend = number(data.get("annual_dividend_per_share"))
+    cost_of_equity = number(capital.get("cost_of_equity"))
+
+    if dividend is None or dividend <= 0:
+        return {"available": False, "reason": "No usable annual dividend per share was available."}
+    if cost_of_equity is None or cost_of_equity <= DDM_DIVIDEND_GROWTH_ASSUMPTION:
+        return {"available": False, "reason": "The required return was too low for a Gordon-growth calculation."}
+
+    value_per_share = (
+        dividend * (1 + DDM_DIVIDEND_GROWTH_ASSUMPTION)
+    ) / (cost_of_equity - DDM_DIVIDEND_GROWTH_ASSUMPTION)
+    sector = str(data.get("sector", "")).upper()
+
+    return {
+        "available": True,
+        "value_per_share": value_per_share,
+        "dividend": dividend,
+        "growth": DDM_DIVIDEND_GROWTH_ASSUMPTION,
+        "discount_rate": cost_of_equity,
+        "most_suitable": sector in DCF_UNSUITABLE_SECTORS or sector == "UTILITIES",
+        "payout_ratio": number(data.get("payout_ratio")),
+    }
+
+
+def calculate_asset_value(data):
+    """Calculate a balance-sheet net-asset value per share when data permits."""
+    total_assets = latest_statement_value(data["balance_sheet"], ["Total Assets"])
+    total_liabilities = latest_statement_value(
+        data["balance_sheet"],
+        ["Total Liabilities Net Minority Interest", "Total Liabilities"],
+    )
+    shares_outstanding, shares_source = shares_outstanding_for_valuation(data)
+
+    if (
+        total_assets is None
+        or total_liabilities is None
+        or shares_outstanding is None
+        or shares_outstanding <= 0
+    ):
+        return {
+            "available": False,
+            "reason": "Total assets, liabilities or shares outstanding were not available.",
+        }
+
+    net_assets = total_assets - total_liabilities
+    if net_assets <= 0:
+        return {"available": False, "reason": "Reported net assets were not positive."}
+
+    sector = str(data.get("sector", "")).upper()
+    return {
+        "available": True,
+        "net_assets": net_assets,
+        "value_per_share": net_assets / shares_outstanding,
+        "shares_source": shares_source,
+        "most_suitable": sector in ASSET_VALUE_SECTORS,
+    }
+
+
+def calculate_valuation_models(data, is_fund):
+    """Calculate the complementary valuation views used in the report."""
+    if is_fund:
+        return {"available": False, "reason": "Company valuation models do not apply to funds or indexes."}
+
+    capital = calculate_cost_of_capital(data)
+    return {
+        "available": True,
+        "capital": capital,
+        "dcf": calculate_dcf_valuation(data, capital),
+        "ddm": calculate_ddm_valuation(data, capital),
+        "asset": calculate_asset_value(data),
+    }
+
+
+def valuation_difference(value, current_price):
+    """Return valuation value as a percentage above/below the current price."""
+    if not is_number(value) or not is_number(current_price) or current_price <= 0:
+        return None
+    return (float(value) / float(current_price)) - 1
+
+
+def valuation_gap_text(value, current_price):
+    """Describe a valuation difference without a signed percentage ambiguity."""
+    difference = valuation_difference(value, current_price)
+    if difference is None:
+        return "not available versus the current price"
+    if difference >= 0:
+        return f"{percentage(difference)} above the current price"
+    return f"{percentage(abs(difference))} below the current price"
+
+
+def dcf_valuation_verdict(current_price, dcf):
+    """Classify price against a DCF range without claiming precise fair value."""
+    if not dcf.get("available") or not is_number(current_price):
+        return None
+
+    cautious_value = dcf["scenarios"]["Cautious"]["value_per_share"]
+    base_value = dcf["scenarios"]["Base"]["value_per_share"]
+    optimistic_value = dcf["scenarios"]["Optimistic"]["value_per_share"]
+    lower_value = min(cautious_value, optimistic_value)
+    upper_value = max(cautious_value, optimistic_value)
+
+    if current_price < lower_value * (1 - VALUATION_BUFFER):
+        label = "POTENTIALLY UNDERVALUED"
+        explanation = (
+            "The current price is more than the uncertainty margin below even "
+            "the cautious DCF value. Check why the market may be more cautious."
+        )
+    elif current_price > upper_value * (1 + VALUATION_BUFFER):
+        label = "POTENTIALLY OVERVALUED"
+        explanation = (
+            "The current price is more than the uncertainty margin above the "
+            "optimistic DCF value. Future cash-flow growth would need to be stronger."
+        )
+    else:
+        label = "ROUGHLY FAIRLY VALUED"
+        explanation = (
+            "The current price sits inside, or close to, the DCF scenario range. "
+            "The model does not show a clear mispricing signal."
+        )
+
+    return {
+        "available": True,
+        "label": label,
+        "basis": "cash-flow DCF scenario range",
+        "explanation": explanation,
+        "lower_value": lower_value,
+        "base_value": base_value,
+        "upper_value": upper_value,
+    }
+
+
+def point_valuation_verdict(current_price, value_per_share, basis):
+    """Classify price against one appropriate valuation estimate, such as DDM."""
+    difference = valuation_difference(value_per_share, current_price)
+    if difference is None:
+        return None
+
+    if difference > VALUATION_BUFFER:
+        label = "POTENTIALLY UNDERVALUED"
+        explanation = (
+            "The current price is materially below this model's value estimate. "
+            "Check whether the dividend or asset assumptions are sustainable."
+        )
+    elif difference < -VALUATION_BUFFER:
+        label = "POTENTIALLY OVERVALUED"
+        explanation = (
+            "The current price is materially above this model's value estimate. "
+            "Check whether the model is missing an important source of value."
+        )
+    else:
+        label = "ROUGHLY FAIRLY VALUED"
+        explanation = (
+            "The current price is close to this model's value estimate. "
+            "The model does not show a clear mispricing signal."
+        )
+
+    return {
+        "available": True,
+        "label": label,
+        "basis": basis,
+        "explanation": explanation,
+        "lower_value": value_per_share,
+        "base_value": value_per_share,
+        "upper_value": value_per_share,
+    }
+
+
+def valuation_verdict(data, is_fund, valuation):
+    """Choose the most suitable available valuation view for a clear verdict."""
+    if is_fund or not valuation.get("available"):
+        return {
+            "available": False,
+            "label": "NOT APPLICABLE",
+            "reason": "Company valuation models do not apply to funds or indexes.",
+        }
+
+    dcf_verdict = dcf_valuation_verdict(data.get("latest_price"), valuation["dcf"])
+    if dcf_verdict is not None:
+        return dcf_verdict
+
+    ddm = valuation["ddm"]
+    if ddm.get("available"):
+        ddm_verdict = point_valuation_verdict(
+            data.get("latest_price"),
+            ddm["value_per_share"],
+            "Gordon-growth dividend model",
+        )
+        if ddm_verdict is not None:
+            return ddm_verdict
+
+    asset = valuation["asset"]
+    if asset.get("available") and asset.get("most_suitable"):
+        return {
+            "available": False,
+            "label": "INCONCLUSIVE",
+            "reason": (
+                "Only reported book net assets were available. They are useful "
+                "context, but they are not enough on their own to call a share "
+                "under- or over-valued."
+            ),
+        }
+
+    dcf_reason = valuation["dcf"].get("reason", "No usable DCF data was available.")
+    return {
+        "available": False,
+        "label": "INCONCLUSIVE",
+        "reason": (
+            "There is not enough suitable valuation data for a price verdict. "
+            f"DCF note: {dcf_reason}"
+        ),
+    }
+
+
+def dcf_price_label(current_price, dcf):
+    """Keep the concise DCF description used by the upside/downside summary."""
+    verdict = dcf_valuation_verdict(current_price, dcf)
+    if verdict is None:
+        return "No cash-flow valuation view is available."
+    return verdict["label"].replace("POTENTIALLY ", "")
+
+
+def print_valuation_verdict(data, is_fund, valuation):
+    """Print the single, plain-English modelled-value classification first."""
+    verdict = valuation_verdict(data, is_fund, valuation)
+
+    print("\nVALUATION VERDICT (MODELLED VALUE, NOT A PRICE TARGET)")
+    print(f"Status: {verdict['label']}")
+
+    if not verdict["available"]:
+        print(f"Why: {verdict['reason']}")
+        return verdict
+
+    current_price = data["latest_price"]
+    currency = data["currency"]
+    print(f"Basis: {verdict['basis']}")
+    print(
+        f"Current price: {money(current_price, currency)}  |  "
+        f"Modelled range: {money(verdict['lower_value'], currency)} to "
+        f"{money(verdict['upper_value'], currency)}"
+    )
+    print(
+        f"Base model value: {money(verdict['base_value'], currency)} "
+        f"({valuation_gap_text(verdict['base_value'], current_price)})."
+    )
+    print(f"What this means: {verdict['explanation']}")
+    print(
+        f"A {percentage(VALUATION_BUFFER)} uncertainty margin is used before "
+        "calling a share potentially under- or over-valued."
+    )
+    return verdict
+
+
+def print_valuation_dashboard(data, is_fund, valuation):
+    """Print a plain-English range of valuation evidence and assumptions."""
+    print("\n" + "=" * 68)
+    print("VALUATION — IS THE CURRENT PRICE IN A SENSIBLE RANGE?")
+    print("=" * 68)
+
+    if is_fund or not valuation.get("available"):
+        print("Not applicable: use fund fees, holdings, benchmark and risk measures instead.")
+        return
+
+    verdict = print_valuation_verdict(data, is_fund, valuation)
+    current_price = data["latest_price"]
+    currency = data["currency"]
+    dcf = valuation["dcf"]
+    ddm = valuation["ddm"]
+    asset = valuation["asset"]
+
+    print(f"Current price used: {money(current_price, currency)}")
+
+    if dcf["available"]:
+        scenarios = dcf["scenarios"]
+        cautious = scenarios["Cautious"]
+        base = scenarios["Base"]
+        optimistic = scenarios["Optimistic"]
+        print("\n1. Cash-flow valuation (DCF — primary view)")
+        print(
+            f"Indicative value per share: {money(cautious['value_per_share'], currency)} "
+            f"cautious | {money(base['value_per_share'], currency)} base | "
+            f"{money(optimistic['value_per_share'], currency)} optimistic"
+        )
+        print(f"Model verdict: {verdict['label']}")
+        print(
+            f"Base case is {valuation_gap_text(base['value_per_share'], current_price)}."
+        )
+        print(
+            f"Inputs: {money(dcf['starting_fcff'], currency)} normalised annual FCFF | "
+            f"{percentage(cautious['cash_flow_growth'])} / {percentage(base['cash_flow_growth'])} / "
+            f"{percentage(optimistic['cash_flow_growth'])} growth | "
+            f"{percentage(cautious['discount_rate'])} / {percentage(base['discount_rate'])} / "
+            f"{percentage(optimistic['discount_rate'])} discount rate"
+        )
+        print(
+            f"Terminal growth is fixed at {percentage(TERMINAL_GROWTH_RATE)}. "
+            "Changing growth or WACC can change the result materially."
+        )
+        if dcf["working_capital_missing_years"]:
+            print(
+                "Data caution: working-capital change was not available for one or more "
+                "cash-flow years and was assumed to be zero."
+            )
+    else:
+        print("\n1. Cash-flow valuation (DCF — primary view)")
+        print(f"Not used: {dcf['reason']}")
+
+    if ddm["available"]:
+        suitability = "well suited to this sector" if ddm["most_suitable"] else "a secondary check for this sector"
+        print("\n2. Dividend valuation (Gordon Growth — supplementary)")
+        print(
+            f"Indicative dividend value: {money(ddm['value_per_share'], currency)} per share "
+            f"({suitability})."
+        )
+        print(
+            f"Assumes {money(ddm['dividend'], currency)} annual dividend growth of "
+            f"{percentage(ddm['growth'])} and required return of {percentage(ddm['discount_rate'])}."
+        )
+    else:
+        print("\n2. Dividend valuation: not available — no sustainable annual dividend input.")
+
+    if asset["available"]:
+        relevance = "most useful for this asset-heavy sector" if asset["most_suitable"] else "a secondary check, not a business value"
+        print("\n3. Asset-based check (reported book net assets)")
+        print(
+            f"Reported net assets imply {money(asset['value_per_share'], currency)} per share "
+            f"({relevance})."
+        )
+        print("This uses accounting values, not independently appraised asset values.")
+    else:
+        print("\n3. Asset-based check: not available from Yahoo Finance statement data.")
+
+    print("\n4. Relative valuation — compare only with direct business peers")
+    print(
+        f"Starting multiples: P/E {number_text(data['pe_ratio'])} | "
+        f"EV/EBITDA {number_text(data['enterprise_to_ebitda'])} | "
+        f"PEG {number_text(data['peg_ratio'])} | "
+        f"Price/book {number_text(data['price_to_book'])}"
+    )
+    print(
+        "Use the optional peer-comparison prompt after the report to compare these "
+        "with competitors. Lower is not automatically better unless growth, risk and debt are similar."
+    )
+    print(
+        "LBO and precedent-deal valuations are not automated because they require "
+        "deal-specific financing, control-premium and transaction data."
+    )
+
+
+def relative_valuation_metrics(info):
+    """Return the standard trading-comparison multiples from Yahoo Finance."""
+    return {
+        "P/E": number(info.get("trailingPE")),
+        "EV/EBITDA": number(info.get("enterpriseToEbitda")),
+        "PEG": number(info.get("pegRatio")),
+        "Price/book": number(info.get("priceToBook")),
+    }
+
+
+def target_relative_valuation_metrics(data):
+    """Return the current company's comparable-multiple inputs."""
+    return {
+        "P/E": number(data.get("pe_ratio")),
+        "EV/EBITDA": number(data.get("enterprise_to_ebitda")),
+        "PEG": number(data.get("peg_ratio")),
+        "Price/book": number(data.get("price_to_book")),
+    }
+
+
+def ask_for_peer_comparison(data):
+    """Optionally compare the company with peer tickers chosen by the user."""
+    response = input(
+        "\nCompare this company with direct peers using valuation multiples? [y/N]: "
+    ).strip().lower()
+    if response not in {"y", "yes"}:
+        return
+
+    peer_input = input(
+        "Enter 1–6 direct peer tickers separated by commas (for example MSFT, GOOGL): "
+    )
+    peer_tickers = []
+    for value in peer_input.split(","):
+        ticker = normalise_yahoo_ticker(value)
+        if ticker and ticker != data["ticker"] and ticker not in peer_tickers:
+            peer_tickers.append(ticker)
+
+    peer_tickers = peer_tickers[:6]
+    if not peer_tickers:
+        print("No peer tickers were entered.")
+        return
+
+    peer_metrics = []
+    for ticker in peer_tickers:
+        info = safe_info(yf.Ticker(ticker))
+        if str(info.get("quoteType", "")).upper() in FUND_TYPES:
+            continue
+
+        metrics = relative_valuation_metrics(info)
+        if any(value is not None and value > 0 for value in metrics.values()):
+            peer_metrics.append((ticker, metrics))
+
+    if not peer_metrics:
+        print("Yahoo Finance did not return usable valuation data for those peers.")
+        return
+
+    target_metrics = target_relative_valuation_metrics(data)
+    print("\n" + "=" * 68)
+    print("DIRECT-PEER VALUATION COMPARISON")
+    print("=" * 68)
+    print(f"Peers used: {', '.join(ticker for ticker, _ in peer_metrics)}")
+    print(f"{'Multiple':<15}{'This company':>15}{'Peer median':>15}  Interpretation")
+    print("-" * 68)
+
+    for metric_name, target_value in target_metrics.items():
+        peer_values = [
+            metrics[metric_name]
+            for _, metrics in peer_metrics
+            if is_number(metrics.get(metric_name)) and metrics[metric_name] > 0
+        ]
+        if not is_number(target_value) or not peer_values:
+            print(f"{metric_name:<15}{'n/a':>15}{'n/a':>15}  Not enough comparable data")
+            continue
+
+        peer_median = median(peer_values)
+        difference = (target_value / peer_median) - 1
+        position = "below" if difference < 0 else "above"
+        print(
+            f"{metric_name:<15}{target_value:>15.2f}{peer_median:>15.2f}  "
+            f"{percentage(abs(difference))} {position} peer median"
+        )
+
+    print(
+        "A lower multiple can reflect lower growth, higher risk or different debt, "
+        "so use this as a question to investigate—not proof that a share is cheap."
+    )
+
+
 def get_stock_data(ticker):
     """Retrieve Yahoo Finance price history and company data for one ticker."""
     ticker = ticker.strip().upper()
@@ -1705,6 +2518,9 @@ def get_stock_data(ticker):
     quote_type = info.get("quoteType", "Unknown")
 
     if str(quote_type).upper() in FUND_TYPES:
+        balance_sheet = None
+        income_statement = None
+        cash_flow = None
         tilbury_checks = None
         drew_checks = None
         plain_bagel_checks = None
@@ -1783,7 +2599,20 @@ def get_stock_data(ticker):
         "return_on_equity": info.get("returnOnEquity"),
         "revenue_growth": info.get("revenueGrowth"),
         "debt_to_equity": info.get("debtToEquity"),
+        "beta": info.get("beta"),
+        "shares_outstanding": info.get("sharesOutstanding"),
+        "enterprise_to_ebitda": info.get("enterpriseToEbitda"),
+        "peg_ratio": info.get("pegRatio"),
+        "price_to_book": info.get("priceToBook"),
+        "annual_dividend_per_share": (
+            info.get("trailingAnnualDividendRate")
+            or info.get("dividendRate")
+        ),
+        "payout_ratio": info.get("payoutRatio"),
         "risk": calculate_risk_metrics(one_year_close),
+        "balance_sheet": balance_sheet,
+        "income_statement": income_statement,
+        "cash_flow": cash_flow,
         "tilbury_checks": tilbury_checks,
         "drew_checks": drew_checks,
         "plain_bagel_checks": plain_bagel_checks,
@@ -1806,87 +2635,53 @@ def tilbury_marker(result):
     return "NO DATA"
 
 
-def print_drew_checklist(checks):
-    """Print the Drew Cohen-inspired checklist with clear analysis labels."""
+def print_framework_checklist(title, checks, introduction=None):
+    """Print any framework's checks in the same compact, readable format."""
     passed_checks, available_checks = tilbury_score(checks)
 
+    print(f"\n{title}")
     print(
-        f"Screening score: {passed_checks}/{len(checks)} favourable checks"
+        f"Summary: {passed_checks}/{len(checks)} favourable checks"
         f"  |  Data available for {available_checks}/{len(checks)} checks"
     )
-    print(
-        "This is a first-pass financial screen. It does not include valuation "
-        "or decide whether to buy."
-    )
+    if introduction:
+        print(introduction)
 
     for check in checks:
         print(
-            f"\n[{tilbury_marker(check['result']):7}] "
-            f"{check['section']} — {check['name']}"
+            f"  [{tilbury_marker(check['result']):7}] {check['name']}"
         )
-        print(f"          Analyses: {check['what_it_analyses']}")
-        print(f"          Result: {check['result_value']}")
-        print(f"          Favourable result: {check['pass_rule']}")
-        print(f"          {check['reason']}")
+        if check.get("what_it_analyses"):
+            print(f"             Checks: {check['what_it_analyses']}")
+        print(f"             Result: {check['result_value']}")
+        print(f"             Pass rule: {check['pass_rule']}")
+        print(f"             Note: {check['reason']}")
 
 
-def print_drew_valuation_step(data):
-    """Explain the manual valuation work that cannot be scored reliably."""
-    print("\nDREW COHEN VALUATION STEP — MANUAL REVIEW REQUIRED")
-    print(
-        "Analyses: whether the current market price is reasonable versus "
-        "conservative future earnings and cash-flow expectations."
+def print_mark_tilbury_checklist(checks):
+    """Print the Mark Tilbury-style quantitative checks every time."""
+    print_framework_checklist(
+        "MARK TILBURY QUANTITATIVE CHECKS",
+        checks,
+        "These are simple annual-statement quality checks, not a valuation or buy signal.",
     )
-    print(
-        f"Available starting figures: P/E {number_text(data['pe_ratio'])}"
-        f"  |  Market value {money(data['market_cap'], data['currency'])}"
-    )
-    print(
-        "Next step: make conservative forecasts for up to three years, then "
-        "use a DCF or reverse DCF. A strong screening score is not a buy signal "
-        "unless the valuation also looks attractive."
+
+
+def print_drew_checklist(checks):
+    """Print the Drew Cohen-inspired checklist with clear analysis labels."""
+    print_framework_checklist(
+        "DREW COHEN-INSPIRED FINANCIAL CHECKLIST",
+        checks,
+        "This is a first-pass financial screen. It does not include valuation or decide whether to buy.",
     )
 
 
 def print_plain_bagel_checklist(checks):
     """Print the Plain Bagel-inspired checklist with clear analysis labels."""
-    passed_checks, available_checks = tilbury_score(checks)
-
-    print(
-        f"Screening score: {passed_checks}/{len(checks)} favourable checks"
-        f"  |  Data available for {available_checks}/{len(checks)} checks"
-    )
-    print(
-        "Yahoo Finance usually supplies only a few annual periods. These checks "
-        "use the longest available history, not a full 5-, 10-, or 15-year study."
-    )
-
-    for check in checks:
-        print(
-            f"\n[{tilbury_marker(check['result']):7}] "
-            f"{check['section']} — {check['name']}"
-        )
-        print(f"          Analyses: {check['what_it_analyses']}")
-        print(f"          Result: {check['result_value']}")
-        print(f"          Favourable result: {check['pass_rule']}")
-        print(f"          {check['reason']}")
-
-
-def print_plain_bagel_valuation_step(data):
-    """Explain the Plain Bagel valuation and peer-comparison work still needed."""
-    print("\nPLAIN BAGEL VALUATION & PEER COMPARISON — MANUAL REVIEW REQUIRED")
-    print(
-        "Analyses: whether this stock is fairly priced against its own history, "
-        "similar companies, and conservative future cash flows."
-    )
-    print(
-        f"Available starting figures: P/E {number_text(data['pe_ratio'])}"
-        f"  |  Market value {money(data['market_cap'], data['currency'])}"
-    )
-    print(
-        "Next step: compare valuation multiples with direct peers and the "
-        "company's history. Use a DCF with conservative forecasts and test how "
-        "the result changes when assumptions change."
+    print_framework_checklist(
+        "PLAIN BAGEL / RICHARD COFFIN FINANCIAL CHECKLIST",
+        checks,
+        "Yahoo Finance usually supplies only a few annual periods, so these use the longest available history rather than a full 5-, 10-, or 15-year study.",
     )
 
 
@@ -2114,28 +2909,23 @@ def print_overall_research_score(data, is_fund):
         )
 
 
-def print_investment_case(data, is_fund):
-    """Summarise the main upside, downside, and next research step."""
+def print_investment_case(data, is_fund, valuation):
+    """Summarise upside and downside in a short, decision-focused format."""
     print("\n" + "=" * 68)
-    print("UPSIDE, DOWNSIDE & RESEARCH OUTCOME")
+    print("QUICK UPSIDE / DOWNSIDE SUMMARY")
     print("=" * 68)
 
     if is_fund:
         print(
-            "This company financial screen does not apply to a fund or index. "
-            "Research its objective, benchmark, fees, holdings, and risk level "
-            "instead."
+            "This company model does not apply to a fund or index. Review its "
+            "objective, benchmark, fees, holdings and risk level instead."
         )
         return
 
     summary = weighted_financial_score(data)
     score = summary["score"]
-
     if score is None:
-        print(
-            "Research outcome: Inconclusive. Yahoo Finance did not provide "
-            "enough usable company financial data for this screen."
-        )
+        print("Inconclusive: there was not enough usable company financial data.")
         return
 
     passed_items = sorted(
@@ -2153,66 +2943,60 @@ def print_investment_case(data, is_fund):
         for item in summary["results"]
         if item["result"] is None and item["priority"] == "HIGH"
     ]
+    dcf = valuation.get("dcf", {})
 
-    print("\nPOTENTIAL UPSIDE — EVIDENCE FROM YOUR CHECKS")
-    if passed_items:
-        for item in passed_items[:3]:
+    print("\nWHAT COULD GO RIGHT")
+    if dcf.get("available"):
+        base_value = dcf["scenarios"]["Base"]["value_per_share"]
+        base_gap = valuation_difference(base_value, data["latest_price"])
+        if base_gap is not None and base_gap > 0:
             print(
-                f"- {item['check_name']} passed (+{item['weight']} points): "
-                f"{item['why']}."
+                f"- Cash-flow upside case: the base DCF value is {percentage(base_gap)} "
+                "above the current price. This only holds if the forecast cash-flow growth happens."
             )
-    else:
-        print("- No weighted financial-strength checks passed with the available data.")
+        else:
+            print(
+                "- The business has a cash-flow valuation range, but the current price "
+                "does not sit below its base case."
+            )
 
-    if is_number(data["one_year_return"]) and data["one_year_return"] > 0:
-        print(
-            f"- Recent price momentum: one-year return is "
-            f"{percentage(data['one_year_return'])}. This is historical, not a forecast."
-        )
+    if passed_items:
+        for item in passed_items[:2]:
+            print(f"- {item['check_name']}: {item['why']}.")
+    else:
+        print("- No major financial strengths could be confirmed from the available data.")
 
     if trend_label(data) == "Upward":
-        print(
-            "- Recent trend: the 50-day average is above the 200-day average. "
-            "This can change quickly and is not a financial-quality measure."
-        )
+        print("- Price trend: the 50-day average is above the 200-day average (short-term evidence only).")
 
-    print("\nPOTENTIAL DOWNSIDE — EVIDENCE TO INVESTIGATE")
-    if concern_items:
-        for item in concern_items[:3]:
+    print("\nWHAT COULD GO WRONG")
+    if dcf.get("available"):
+        base_value = dcf["scenarios"]["Base"]["value_per_share"]
+        base_gap = valuation_difference(base_value, data["latest_price"])
+        if base_gap is not None and base_gap < 0:
             print(
-                f"- {item['check_name']} did not pass (0/{item['weight']} points): "
-                f"{item['why']}."
+                f"- Cash-flow downside case: the base DCF value is {percentage(abs(base_gap))} "
+                "below the current price. Future growth would need to beat the base assumptions."
             )
-    else:
-        print("- No weighted financial checks failed, but that does not remove investment risk.")
 
-    for item in missing_core_items:
+    if concern_items:
+        for item in concern_items[:2]:
+            print(f"- {item['check_name']}: {item['why']}.")
+    else:
+        print("- No weighted financial checks failed, but that does not remove business or valuation risk.")
+
+    for item in missing_core_items[:1]:
         print(
-            f"- Missing core data: {item['check_name']} could not be checked, "
-            "so the financial picture is incomplete."
+            f"- Missing core evidence: {item['check_name']} could not be checked, "
+            "so the financial picture is less certain."
         )
 
     risk = data["risk"]
     if is_number(risk["maximum_drawdown"]):
         print(
-            f"- Historical price risk: the largest fall from a prior peak in the "
-            f"last year was {percentage(risk['maximum_drawdown'])}."
+            f"- Price risk: the largest fall from a prior high in the last year was "
+            f"{percentage(risk['maximum_drawdown'])}."
         )
-
-    if is_number(data["pe_ratio"]):
-        if data["pe_ratio"] > 30:
-            print(
-                f"- Valuation requires care: the P/E ratio is "
-                f"{number_text(data['pe_ratio'])}. Compare it with direct peers "
-                "and expected growth before investing."
-            )
-        elif data["pe_ratio"] <= 0:
-            print(
-                "- Valuation requires care: a positive P/E ratio is not available, "
-                "so this simple valuation comparison is not useful."
-            )
-    else:
-        print("- Valuation is not available from a usable P/E ratio.")
 
     screen_result = financial_screen_label(
         score,
@@ -2220,31 +3004,12 @@ def print_investment_case(data, is_fund):
         summary["high_priority_failures"],
         summary["high_priority_missing"],
     )
-
-    print("\nWHAT YOUR ANALYSIS SIGNALS")
-    print(f"- Financial-quality score: {score:.0f}/100")
-    print(f"- Status: {screen_result}")
-
-    if (
-        score >= 70
-        and summary["data_coverage"] >= 85
-        and not summary["high_priority_failures"]
-        and not summary["high_priority_missing"]
-    ):
-        print(
-            "- Outcome: this is a potential candidate for a valuation and "
-            "business-risk review. It is not yet a buy recommendation."
-        )
-    else:
-        print(
-            "- Outcome: do not treat this as an investment candidate yet. "
-            "First explain the failed checks or obtain the missing data, then "
-            "complete valuation and risk research."
-        )
-
+    print("\nBOTTOM LINE FOR RESEARCH")
+    print(f"- Financial foundation: {score:.0f}/100 — {screen_result}")
+    print(f"- Price versus DCF: {dcf_price_label(data['latest_price'], dcf)}")
     print(
-        "- Final step: read the latest annual report and results release, then "
-        "compare valuation and financial measures with direct competitors."
+        "- Next check: read the newest results release, then compare the valuation "
+        "multiples with direct competitors before making any investment decision."
     )
 
 
@@ -2255,10 +3020,30 @@ def trend_label(data):
     return "Upward" if data["average_50"] > data["average_200"] else "Downward"
 
 
+def print_analysis_checklists(data, is_fund):
+    """Always show the frameworks that feed the research score."""
+    print("\n" + "=" * 68)
+    print("ANALYSIS CHECKS — ALL FRAMEWORKS")
+    print("=" * 68)
+
+    if is_fund:
+        print(
+            "Not applicable: the Mark Tilbury, Drew Cohen and Plain Bagel "
+            "company-statement checks do not suit funds or indexes."
+        )
+        return
+
+    print_mark_tilbury_checklist(data["tilbury_checks"])
+    print_drew_checklist(data["drew_checks"])
+    print_plain_bagel_checklist(data["plain_bagel_checks"])
+    print_overall_research_score(data, is_fund)
+
+
 def print_report(data):
     """Print a concise Yahoo Finance research report."""
     risk = data["risk"]
     is_fund = str(data["type"]).upper() in FUND_TYPES
+    valuation = calculate_valuation_models(data, is_fund)
 
     print("\n" + "=" * 68)
     print(f"{data['name']} ({data['ticker']}) | {data['type']}")
@@ -2312,50 +3097,9 @@ def print_report(data):
         f"  |  Below one-year high: {percentage(risk['current_drawdown'])}"
     )
 
-    print("\nMARK TILBURY QUANTITATIVE CHECKS")
-    if is_fund:
-        print("Not applicable: these company financial-statement checks do not suit funds or indexes.")
-    else:
-        checks = data["tilbury_checks"]
-        passed_checks, available_checks = tilbury_score(checks)
-        print(
-            f"Score: {passed_checks}/3 checks passed"
-            f"  |  Data available for {available_checks}/3 checks"
-        )
-
-        print("Each check shows: result, pass rule, and explanation.")
-
-        for check in checks:
-            print(
-                f"\n[{tilbury_marker(check['result']):7}] "
-                f"{check['section']} — {check['name']}"
-            )
-            print(f"          Result: {check['result_value']}")
-            print(f"          Pass rule: {check['pass_rule']}")
-            print(f"          {check['reason']}")
-
-    print("\nDREW COHEN-INSPIRED FINANCIAL CHECKLIST")
-    if is_fund:
-        print(
-            "Not applicable: this company financial-statement checklist does "
-            "not suit funds or indexes."
-        )
-    else:
-        print_drew_checklist(data["drew_checks"])
-        print_drew_valuation_step(data)
-
-    print("\nPLAIN BAGEL / RICHARD COFFIN FINANCIAL CHECKLIST")
-    if is_fund:
-        print(
-            "Not applicable: this company financial-statement checklist does "
-            "not suit funds or indexes."
-        )
-    else:
-        print_plain_bagel_checklist(data["plain_bagel_checks"])
-        print_plain_bagel_valuation_step(data)
-
-    print_overall_research_score(data, is_fund)
-    print_investment_case(data, is_fund)
+    print_valuation_dashboard(data, is_fund, valuation)
+    print_investment_case(data, is_fund, valuation)
+    print_analysis_checklists(data, is_fund)
 
     print(
         "\nThese are simple financial rules of thumb, not a buy or sell "
@@ -2366,7 +3110,10 @@ def print_report(data):
 def research_stock(ticker):
     """Research one stock, fund, ETF, or index."""
     try:
-        print_report(get_stock_data(ticker))
+        data = get_stock_data(ticker)
+        print_report(data)
+        if str(data["type"]).upper() not in FUND_TYPES:
+            ask_for_peer_comparison(data)
     except Exception as error:
         print(f"\nCould not research this ticker: {error}")
 
