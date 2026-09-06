@@ -17,15 +17,29 @@ import yfinance as yf
 FUND_TYPES = {"ETF", "MUTUALFUND", "INDEX"}
 SECTOR_SPECIFIC_SCORE_SECTORS = {"FINANCIAL SERVICES", "REAL ESTATE"}
 
-# Screening every S&P 500 company needs many Yahoo Finance requests. Financial
-# statements change after results are released, not minute by minute, so reuse a
-# score for one day by default. The live S&P 500 and Most Active lists are still
-# retrieved fresh on every screen run, and the menu offers a force-refresh.
+# The two stock universes are fetched fresh on every screen run. The financial
+# score is based on annual statements, which normally change only when a company
+# reports results, so it is reused briefly to avoid excessive Yahoo requests.
+# Live price, day change, volume, and market-cap details are never read from this
+# cache: they come from the fresh screen response each time.
 SCREEN_CACHE_FILE = Path(__file__).with_name("stock_screener_cache.json")
-SCREEN_CACHE_MAX_AGE = timedelta(hours=24)
-SCREEN_REQUEST_DELAY_SECONDS = 0.15
+SCREEN_CACHE_MAX_AGE = timedelta(hours=6)
+SCREEN_REQUEST_DELAY_SECONDS = 0.25
 DEFAULT_SCREEN_RESULTS = 15
 MAX_SCREEN_RESULTS = 50
+DEFAULT_ACTIVE_STOCKS = 100
+DEFAULT_EMERGING_STOCKS = 100
+MAX_SCREEN_UNIVERSE = 250
+
+# "Emerging" here means smaller, US-listed operating companies; it does not
+# mean companies based in emerging-market countries. These limits are deliberately
+# set above penny-stock territory and require reasonable liquidity. The financial
+# model below is still the actual quality filter.
+EMERGING_MIN_MARKET_CAP = 50_000_000
+EMERGING_MAX_MARKET_CAP = 2_000_000_000
+EMERGING_MIN_PRICE = 2.00
+EMERGING_MIN_DAY_VOLUME = 200_000
+EMERGING_MIN_AVERAGE_VOLUME = 250_000
 
 
 # These weights are for a first-pass financial-quality screen, not a prediction
@@ -1061,52 +1075,30 @@ def normalise_yahoo_ticker(value):
     return ticker.replace(".", "-")
 
 
-def tickers_from_table(table):
-    """Extract tickers from a Yahoo Finance table or DataFrame-like object."""
-    if table is None or getattr(table, "empty", False):
-        return []
+def get_screen_quotes(response, source_name):
+    """Return valid live Yahoo Finance quote dictionaries from a screen result."""
+    quotes = response.get("quotes", []) if isinstance(response, dict) else []
+    cleaned_quotes = []
 
-    columns = list(getattr(table, "columns", []))
-    for column in ("symbol", "Symbol", "ticker", "Ticker"):
-        if column in columns:
-            try:
-                return [
-                    normalise_yahoo_ticker(value)
-                    for value in table[column].tolist()
-                    if normalise_yahoo_ticker(value)
-                ]
-            except (KeyError, AttributeError, TypeError):
-                continue
+    for quote in quotes:
+        if not isinstance(quote, dict):
+            continue
 
-    try:
-        return [
-            normalise_yahoo_ticker(value)
-            for value in table.index.tolist()
-            if normalise_yahoo_ticker(value)
-        ]
-    except (AttributeError, TypeError):
-        return []
+        ticker = normalise_yahoo_ticker(quote.get("symbol", ""))
+        if ticker:
+            cleaned_quotes.append({**quote, "symbol": ticker, "source": source_name})
 
-
-def get_sp500_tickers():
-    """Get the current S&P 500 component list from Yahoo Finance."""
-    index = yf.Ticker("^GSPC")
-    components = getattr(index, "components", None)
-    if callable(components):
-        components = components()
-
-    tickers = tickers_from_table(components)
-    if not tickers:
+    if not cleaned_quotes:
         raise RuntimeError(
-            "Yahoo Finance did not return the current S&P 500 components. "
-            "Update yfinance with: pip install --upgrade yfinance, then try again."
+            f"Yahoo Finance did not return any {source_name} stocks. "
+            "Try again during US market hours or later today."
         )
 
-    return list(dict.fromkeys(tickers))
+    return cleaned_quotes
 
 
-def get_most_active_tickers(limit=25):
-    """Get Yahoo Finance's current US Most Active stock list."""
+def get_most_active_quotes(limit=DEFAULT_ACTIVE_STOCKS):
+    """Get a larger, current US Most Active list with live quote details."""
     screen = getattr(yf, "screen", None)
     if screen is None:
         raise RuntimeError(
@@ -1114,23 +1106,51 @@ def get_most_active_tickers(limit=25):
             "Update it with: pip install --upgrade yfinance"
         )
 
-    response = screen("most_actives", count=min(limit, 250))
-    quotes = response.get("quotes", []) if isinstance(response, dict) else []
-    tickers = []
-    for quote in quotes:
-        if not isinstance(quote, dict):
-            continue
-        ticker = normalise_yahoo_ticker(quote.get("symbol", ""))
-        if ticker:
-            tickers.append(ticker)
+    response = screen("most_actives", count=min(limit, MAX_SCREEN_UNIVERSE))
+    return get_screen_quotes(response, "Yahoo Most Active")
 
-    if not tickers:
+
+def get_emerging_stock_quotes(limit=DEFAULT_EMERGING_STOCKS):
+    """Get liquid smaller US companies, then let the financial model rank them.
+
+    The Yahoo query only defines a tradeable small-company universe. It does
+    not award any model points itself, so every result still has to pass the
+    same financial checks as an established company.
+    """
+    screen = getattr(yf, "screen", None)
+    query_class = getattr(yf, "EquityQuery", None)
+
+    if screen is None or query_class is None:
         raise RuntimeError(
-            "Yahoo Finance did not return any Most Active stocks. Try again "
-            "during US market hours or later today."
+            "This yfinance version cannot run the emerging-company screen. "
+            "Update it with: pip install --upgrade yfinance"
         )
 
-    return list(dict.fromkeys(tickers))
+    query = query_class(
+        "and",
+        [
+            query_class("eq", ["region", "us"]),
+            query_class("is-in", ["exchange", "NMS", "NYQ", "ASE"]),
+            query_class(
+                "btwn",
+                [
+                    "intradaymarketcap",
+                    EMERGING_MIN_MARKET_CAP,
+                    EMERGING_MAX_MARKET_CAP,
+                ],
+            ),
+            query_class("gte", ["intradayprice", EMERGING_MIN_PRICE]),
+            query_class("gte", ["dayvolume", EMERGING_MIN_DAY_VOLUME]),
+            query_class("gte", ["avgdailyvol3m", EMERGING_MIN_AVERAGE_VOLUME]),
+        ],
+    )
+    response = screen(
+        query,
+        size=min(limit, MAX_SCREEN_UNIVERSE),
+        sortField="dayvolume",
+        sortAsc=False,
+    )
+    return get_screen_quotes(response, "Liquid small / emerging company")
 
 
 def get_screening_data(ticker):
@@ -1166,6 +1186,72 @@ def get_screening_data(ticker):
             balance_sheet, income_statement, cash_flow, currency
         ),
     }
+
+
+def first_quote_value(quote, field_names):
+    """Return the first present field from a Yahoo Finance screen quote."""
+    if not isinstance(quote, dict):
+        return None
+
+    for field_name in field_names:
+        value = quote.get(field_name)
+        if value is not None and value != "":
+            return value
+
+    return None
+
+
+def live_quote_snapshot(quote):
+    """Keep just the fresh, readable fields used in the screener output."""
+    price = number(first_quote_value(quote, ["regularMarketPrice", "price"]))
+    day_change = number(
+        first_quote_value(
+            quote,
+            ["regularMarketChangePercent", "percentchange", "changePercent"],
+        )
+    )
+    day_volume = number(
+        first_quote_value(quote, ["regularMarketVolume", "dayVolume", "volume"])
+    )
+    average_volume = number(
+        first_quote_value(
+            quote,
+            ["averageDailyVolume3Month", "avgDailyVolume3Month"],
+        )
+    )
+    market_cap = number(first_quote_value(quote, ["marketCap", "marketcap"]))
+
+    return {
+        "name": first_quote_value(quote, ["longName", "shortName", "displayName"]),
+        "currency": first_quote_value(quote, ["currency"]) or "$",
+        "price": price,
+        "day_change": day_change,
+        "day_volume": day_volume,
+        "average_volume": average_volume,
+        "relative_volume": (
+            day_volume / average_volume
+            if is_number(day_volume) and is_number(average_volume) and average_volume > 0
+            else None
+        ),
+        "market_cap": market_cap,
+    }
+
+
+def update_record_with_live_quote(record, quote, sources):
+    """Attach a fresh quote to a cached-or-new financial score."""
+    updated_record = dict(record)
+    snapshot = live_quote_snapshot(quote)
+
+    if snapshot["name"]:
+        updated_record["name"] = str(snapshot["name"])
+
+    updated_record.update(snapshot)
+    updated_record["sources"] = list(sources)
+    updated_record["live_quote_checked_at"] = utc_timestamp()
+    updated_record["emerging_watchlist"] = is_emerging_watchlist_candidate(
+        updated_record
+    )
+    return updated_record
 
 
 def is_screen_candidate(summary):
@@ -1207,16 +1293,49 @@ def make_screen_record(ticker):
     }
 
 
-def add_source_tickers(ticker_sources, tickers, source_name):
-    """Keep each ticker once while recording which fresh list included it."""
-    for ticker in tickers:
-        ticker_sources.setdefault(ticker, []).append(source_name)
+def is_emerging_watchlist_candidate(record):
+    """Flag promising smaller companies with one missing core-history check.
+
+    Newer public companies can have a shorter statement history, so this is a
+    watchlist label rather than a full model match. No failed high-priority
+    checks are allowed.
+    """
+    is_emerging = "Liquid small / emerging company" in record.get("sources", [])
+    return bool(
+        is_emerging
+        and not record.get("candidate")
+        and is_number(record.get("score"))
+        and record["score"] >= 70
+        and record.get("data_coverage", 0) >= 70
+        and record.get("high_priority_failures", 0) == 0
+        and record.get("high_priority_missing", 0) <= 1
+    )
+
+
+def add_source_quotes(ticker_sources, quotes):
+    """Keep each ticker once while retaining its freshest screen quote."""
+    for quote in quotes:
+        ticker = normalise_yahoo_ticker(quote.get("symbol", ""))
+        source_name = str(quote.get("source", "Yahoo Finance screen"))
+
+        if not ticker:
+            continue
+
+        entry = ticker_sources.setdefault(
+            ticker,
+            {"sources": [], "quote": quote},
+        )
+        if source_name not in entry["sources"]:
+            entry["sources"].append(source_name)
+        entry["quote"] = quote
 
 
 def screen_result_status(record):
     """Return a short status that keeps the results table easy to read."""
     if record["candidate"]:
-        return "RESEARCH CANDIDATE"
+        return "MODEL MATCH"
+    if record.get("emerging_watchlist"):
+        return "EMERGING WATCHLIST"
     if record["high_priority_failures"]:
         return "CORE CONCERN"
     if record["high_priority_missing"] or record["data_coverage"] < 85:
@@ -1224,79 +1343,209 @@ def screen_result_status(record):
     return "MIXED"
 
 
-def print_screening_results(records, failed_count, fresh_count, cached_count, top_count):
-    """Print only the strongest matches for the user's financial model."""
-    candidates = sorted(
-        (record for record in records if record["candidate"]),
-        key=lambda record: (-record["score"], -record["data_coverage"], record["ticker"]),
+def compact_number(value):
+    """Format a large quantity compactly for the screener table."""
+    if not is_number(value):
+        return "n/a"
+
+    value = float(value)
+    absolute_value = abs(value)
+
+    if absolute_value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.2f}B"
+    if absolute_value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if absolute_value >= 1_000:
+        return f"{value / 1_000:.0f}K"
+    return f"{value:.0f}"
+
+
+def compact_money(value, currency="$"):
+    """Format a market price or market value without an overly wide table."""
+    if not is_number(value):
+        return "n/a"
+
+    prefix = "$" if currency == "$" else f"{currency} "
+    value = float(value)
+    absolute_value = abs(value)
+
+    if absolute_value >= 1_000_000_000:
+        return f"{prefix}{value / 1_000_000_000:.2f}B"
+    if absolute_value >= 1_000_000:
+        return f"{prefix}{value / 1_000_000:.1f}M"
+    if absolute_value >= 1_000:
+        return f"{prefix}{value / 1_000:.1f}K"
+    return f"{prefix}{value:.2f}"
+
+
+def signed_percentage_points(value):
+    """Format Yahoo's already-percent day-change field."""
+    if not is_number(value):
+        return "n/a"
+    return f"{float(value):+.2f}%"
+
+
+def score_sort_value(value):
+    """Use missing live values at the end of a ranked result list."""
+    return float(value) if is_number(value) else -1.0
+
+
+def screen_sort_key(record):
+    """Rank quality first, then put the most actively traded matches first."""
+    return (
+        -score_sort_value(record.get("score")),
+        -score_sort_value(record.get("data_coverage")),
+        -score_sort_value(record.get("relative_volume")),
+        -score_sort_value(record.get("day_volume")),
+        record.get("ticker", ""),
     )
 
-    print("\n" + "=" * 84)
-    print("STOCK SCREENER — STRONGEST MATCHES FOR YOUR FINANCIAL MODEL")
-    print("=" * 84)
+
+def print_screen_table(title, records, top_count, watchlist=False):
+    """Print a compact, current-data table for one group of screen results."""
+    records = sorted(records, key=screen_sort_key)
+
+    print(f"\n{title}")
+    if not records:
+        print("  None in this run.")
+        return
+
     print(
-        f"Live stock lists refreshed: {utc_timestamp()} | "
+        f"{'#':<3}{'Ticker':<9}{'Score':>8}{'Data':>7}{'Today':>9}"
+        f"{'Rel vol':>9}{'Price':>11}{'Mkt cap':>12}  Company"
+    )
+    print("-" * 112)
+
+    for rank, record in enumerate(records[:top_count], start=1):
+        score = f"{record['score']:.0f}/100" if is_number(record.get("score")) else "n/a"
+        coverage = (
+            f"{record['data_coverage']:.0f}%"
+            if is_number(record.get("data_coverage"))
+            else "n/a"
+        )
+        relative_volume = (
+            f"{record['relative_volume']:.1f}x"
+            if is_number(record.get("relative_volume"))
+            else "n/a"
+        )
+        name = str(record.get("name", record["ticker"]))[:34]
+
+        print(
+            f"{rank:<3}{record['ticker']:<9}{score:>8}{coverage:>7}"
+            f"{signed_percentage_points(record.get('day_change')):>9}"
+            f"{relative_volume:>9}"
+            f"{compact_money(record.get('price'), record.get('currency', '$')):>11}"
+            f"{compact_money(record.get('market_cap'), record.get('currency', '$')):>12}  "
+            f"{name}"
+        )
+
+    if len(records) > top_count:
+        label = "watchlist names" if watchlist else "model matches"
+        print(f"Showing the top {top_count} of {len(records)} {label}.")
+
+
+def print_screening_results(records, failed_count, fresh_count, cached_count, top_count):
+    """Print strict model matches plus a transparent emerging-stock watchlist."""
+    candidates = [record for record in records if record["candidate"]]
+    emerging_watchlist = [
+        record for record in records if record.get("emerging_watchlist")
+    ]
+
+    print("\n" + "=" * 112)
+    print("LIVE US STOCK SCREENER — FINANCIAL MODEL MATCHES")
+    print("=" * 112)
+    quote_times = [
+        record.get("live_quote_checked_at")
+        for record in records
+        if record.get("live_quote_checked_at")
+    ]
+    latest_quote_time = max(quote_times) if quote_times else "Not available"
+    print(
+        f"Live quote snapshot: {latest_quote_time} | "
         f"Companies scored: {len(records)} | Could not score: {failed_count}"
     )
     print(
         f"Financial scores used: {fresh_count} refreshed now, {cached_count} "
-        "reused from the last 24 hours"
+        f"reused from the last {int(SCREEN_CACHE_MAX_AGE.total_seconds() // 3600)} hours"
     )
     print(
-        "A research candidate needs: score 70+; at least 85% weighted data "
-        "coverage; and no failed or missing high-priority check."
+        "Live price, day change, volume and market value are refreshed on every run. "
+        "The financial score uses annual company statements."
+    )
+    print(
+        "Strict model match: score 70+; data coverage 85%+; no failed or missing "
+        "high-priority check."
     )
 
-    if not candidates:
-        print(
-            "\nNo company cleared every safeguard in this run. This does not "
-            "mean there are no good investments; it means none currently fit "
-            "all of your financial rules with sufficiently complete Yahoo data."
-        )
+    print_screen_table(
+        "STRICT MODEL MATCHES — RESEARCH CANDIDATES, NOT BUY RECOMMENDATIONS",
+        candidates,
+        top_count,
+    )
+
+    print_screen_table(
+        "SMALL / EMERGING WATCHLIST — ONE CORE HISTORY CHECK MAY BE MISSING",
+        emerging_watchlist,
+        top_count,
+        watchlist=True,
+    )
+
+    print(
+        "\nRel vol = today's volume ÷ the three-month average daily volume. "
+        "High activity can be caused by either good or bad news, so it is not a score bonus."
+    )
+    print(
+        "The small / emerging universe is US-listed companies with market value "
+        "$50m–$2bn, price $2+, and minimum day/average-volume checks. "
+        "Research any name individually before considering it."
+    )
+
+
+def refresh_live_quote_sources(ticker_sources, source_loaders):
+    """Refresh quotes after financial scoring, without redoing statements."""
+    refreshed_sources = {}
+    errors = []
+
+    for source_loader in source_loaders:
+        try:
+            add_source_quotes(refreshed_sources, source_loader())
+        except Exception as error:
+            errors.append(str(error))
+
+    for ticker, source_data in refreshed_sources.items():
+        if ticker in ticker_sources:
+            ticker_sources[ticker] = source_data
+
+    if refreshed_sources:
         return
 
-    print("\nTOP RESEARCH CANDIDATES — NOT BUY RECOMMENDATIONS")
-    print(
-        f"{'#':<4}{'Ticker':<9}{'Score':>7}  {'Data':>7}  {'Sector':<22}  Company"
-    )
-    print("-" * 84)
-    for rank, record in enumerate(candidates[:top_count], start=1):
-        sector = record["sector"][:22]
-        name = record["name"][:31]
+    if errors:
         print(
-            f"{rank:<4}{record['ticker']:<9}{record['score']:>6.0f}/100  "
-            f"{record['data_coverage']:>5.0f}%  {sector:<22}  {name}"
+            "Could not refresh live quotes after the financial screen. "
+            "Showing the quote snapshot from the start of this run."
         )
 
-    if len(candidates) > top_count:
-        print(f"\nShowing the top {top_count} of {len(candidates)} research candidates.")
 
-    print(
-        "\nNext step: research an individual ticker from this list to see the "
-        "full checklist, valuation prompts, downside evidence, and risks."
-    )
-    print(
-        "The ranking identifies the strongest matches for your historical "
-        "financial model. It cannot decide whether a share is fairly valued or "
-        "will outperform."
-    )
-
-
-def screen_stock_universe(ticker_sources, top_count, force_refresh=False):
+def screen_stock_universe(
+    ticker_sources,
+    top_count,
+    force_refresh=False,
+    source_loaders=None,
+):
     """Score a live stock universe and rank the strongest research candidates."""
     cache = load_screen_cache()
-    scored_records = []
+    financial_records = []
     failed_count = 0
     fresh_count = 0
     cached_count = 0
     total = len(ticker_sources)
 
     print(
-        f"\nScreening {total} companies. The first full S&P 500 screen can take "
-        "several minutes because Yahoo financial statements are checked company by company."
+        f"\nScreening {total} companies. A first-time screen can take several minutes "
+        "because annual statements are checked company by company."
     )
 
-    for position, (ticker, sources) in enumerate(ticker_sources.items(), start=1):
+    for position, (ticker, source_data) in enumerate(ticker_sources.items(), start=1):
         if position == 1 or position == total or position % 25 == 0:
             print(f"Progress: {position}/{total} companies checked...")
 
@@ -1314,8 +1563,22 @@ def screen_stock_universe(ticker_sources, top_count, force_refresh=False):
                 failed_count += 1
                 continue
 
-        record["sources"] = list(sources)
-        scored_records.append(record)
+        financial_records.append((ticker, record))
+
+    if source_loaders:
+        print("Refreshing live quotes for the final results...")
+        refresh_live_quote_sources(ticker_sources, source_loaders)
+
+    scored_records = []
+    for ticker, record in financial_records:
+        source_data = ticker_sources[ticker]
+        scored_records.append(
+            update_record_with_live_quote(
+                record,
+                source_data["quote"],
+                source_data["sources"],
+            )
+        )
 
     save_screen_cache(cache)
     print_screening_results(
@@ -1338,10 +1601,27 @@ def read_screen_result_count():
         return DEFAULT_SCREEN_RESULTS
 
 
-def should_force_screen_refresh():
-    """Let the user choose accuracy now versus a much quicker cached screen."""
+def read_screen_universe_size(label, default_size):
+    """Ask how much of a current Yahoo screen should be financially checked."""
     response = input(
-        "Refresh every company financial score now? This can take much longer. [y/N]: "
+        f"How many {label} should be screened? "
+        f"[default {default_size}, maximum {MAX_SCREEN_UNIVERSE}]: "
+    ).strip()
+
+    if not response:
+        return default_size
+
+    try:
+        return max(1, min(int(response), MAX_SCREEN_UNIVERSE))
+    except ValueError:
+        print(f"Using the default of {default_size} companies.")
+        return default_size
+
+
+def should_force_screen_refresh():
+    """Let the user refresh annual data while always refreshing live quotes."""
+    response = input(
+        "Refresh every annual financial score now? Live quotes are always fresh. [y/N]: "
     ).strip().lower()
     return response in {"y", "yes"}
 
@@ -1349,17 +1629,36 @@ def should_force_screen_refresh():
 def run_stock_screener(choice):
     """Build the selected live universe and run the weighted financial screen."""
     ticker_sources = {}
+    source_loaders = []
 
     try:
         if choice in {"2", "4"}:
-            sp500_tickers = get_sp500_tickers()
-            add_source_tickers(ticker_sources, sp500_tickers, "S&P 500")
-            print(f"Loaded {len(sp500_tickers)} current S&P 500 ticker listings from Yahoo Finance.")
+            active_limit = read_screen_universe_size(
+                "current Most Active companies",
+                DEFAULT_ACTIVE_STOCKS,
+            )
+            active_quotes = get_most_active_quotes(active_limit)
+            add_source_quotes(ticker_sources, active_quotes)
+            source_loaders.append(
+                lambda: get_most_active_quotes(active_limit)
+            )
+            print(
+                f"Loaded {len(active_quotes)} current Yahoo Finance Most Active companies."
+            )
 
         if choice in {"3", "4"}:
-            active_tickers = get_most_active_tickers()
-            add_source_tickers(ticker_sources, active_tickers, "Yahoo Most Active")
-            print(f"Loaded {len(active_tickers)} current Yahoo Finance Most Active stocks.")
+            emerging_limit = read_screen_universe_size(
+                "liquid small / emerging companies",
+                DEFAULT_EMERGING_STOCKS,
+            )
+            emerging_quotes = get_emerging_stock_quotes(emerging_limit)
+            add_source_quotes(ticker_sources, emerging_quotes)
+            source_loaders.append(
+                lambda: get_emerging_stock_quotes(emerging_limit)
+            )
+            print(
+                f"Loaded {len(emerging_quotes)} liquid small / emerging companies."
+            )
     except Exception as error:
         print(f"\nCould not build the live screen list: {error}")
         return
@@ -1370,7 +1669,12 @@ def run_stock_screener(choice):
 
     top_count = read_screen_result_count()
     force_refresh = should_force_screen_refresh()
-    screen_stock_universe(ticker_sources, top_count, force_refresh)
+    screen_stock_universe(
+        ticker_sources,
+        top_count,
+        force_refresh,
+        source_loaders,
+    )
 
 
 def get_stock_data(ticker):
@@ -2073,9 +2377,9 @@ def main():
 
     while True:
         print("\n1. Research one ticker")
-        print("2. Screen the current S&P 500")
-        print("3. Screen Yahoo Finance's current Most Active stocks")
-        print("4. Screen both lists together (duplicates removed)")
+        print("2. Screen more of Yahoo Finance's current Most Active companies")
+        print("3. Screen liquid small / emerging US companies")
+        print("4. Screen both live lists together (duplicates removed)")
         print("5. Clear saved screener scores")
         print("Q. Quit")
         choice = input("\nChoose an option: ").strip().lower()
