@@ -12,9 +12,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
 
-import yfinance as yf
-
-
 FUND_TYPES = {"ETF", "MUTUALFUND", "INDEX"}
 SECTOR_SPECIFIC_SCORE_SECTORS = {"FINANCIAL SERVICES", "REAL ESTATE"}
 
